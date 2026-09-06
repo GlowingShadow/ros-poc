@@ -4,6 +4,9 @@ services:
       context: .
       dockerfile: Dockerfile
     gpus: all
+    # docker-in-docker (the devcontainer feature) needs a privileged container
+    # so the nested Docker daemon can start.
+    privileged: true
     environment:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
     volumes:

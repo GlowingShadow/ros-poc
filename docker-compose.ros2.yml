@@ -12,6 +12,7 @@ x-ros2-app: &ros2-app
   networks: [ros2net]
   environment: &ros2-app-env
     MODE: ${MODE:-copy}
+    FORCE_REBUILD: ${FORCE_REBUILD:-0}
     ROS_DOMAIN_ID: "42"
     RMW_IMPLEMENTATION: rmw_fastrtps_cpp
   volumes:
