@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <profiles>
+        <!-- "copy" mode: force a full serialize + copy on every publish/take, even though
+             containers share an IPC namespace and Fast DDS would otherwise auto-upgrade
+             same-host traffic to zero-copy data-sharing. -->
+        <data_writer profile_name="pipeline_datawriter" is_default_profile="true">
+            <qos>
+                <data_sharing>
+                    <kind>OFF</kind>
+                </data_sharing>
+            </qos>
+        </data_writer>
+        <data_reader profile_name="pipeline_datareader" is_default_profile="true">
+            <qos>
+                <data_sharing>
+                    <kind>OFF</kind>
+                </data_sharing>
+            </qos>
+        </data_reader>
+    </profiles>
+</dds>

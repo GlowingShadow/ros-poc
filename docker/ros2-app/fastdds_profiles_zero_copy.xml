@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <profiles>
+        <!-- "zero_copy" mode: enable Fast DDS Data-Sharing so same-host publishers/subscribers
+             (containers sharing an IPC namespace via `ipc: shareable` / `ipc: service:manager`
+             in docker-compose.ros2.yml) exchange samples via shared memory without a copy. -->
+        <data_writer profile_name="pipeline_datawriter" is_default_profile="true">
+            <qos>
+                <data_sharing>
+                    <kind>AUTOMATIC</kind>
+                </data_sharing>
+            </qos>
+        </data_writer>
+        <data_reader profile_name="pipeline_datareader" is_default_profile="true">
+            <qos>
+                <data_sharing>
+                    <kind>AUTOMATIC</kind>
+                </data_sharing>
+            </qos>
+        </data_reader>
+    </profiles>
+</dds>

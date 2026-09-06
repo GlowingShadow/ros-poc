@@ -1,0 +1,29 @@
+{
+  "name": "ros poc",
+  "dockerComposeFile": ["docker-compose.yml"],
+  "service": "ros-poc",
+  "runServices": [],
+  "shutdownAction": "none", // prevents VS Code from killing Nginx when you exit
+  "workspaceFolder": "/workspace",
+  "features": {
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {},
+    "ghcr.io/devcontainers/features/python:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "esbenp.prettier-vscode"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "[json]": {
+          "editor.defaultFormatter": "esbenp.prettier-vscode"
+        }
+      }
+    }
+  },
+  "postStartCommand": "sudo bash -c 'mkdir -p /home/vscode/.ssh && cp -p /tmp/host-ssh/* /home/vscode/.ssh/ && chown -R vscode:vscode /home/vscode/.ssh && chmod 700 /home/vscode/.ssh && find /home/vscode/.ssh -type f -exec chmod 600 {} \\; && chown vscode:vscode /home/vscode/.gitconfig /home/vscode/.gitconfig-pro /home/vscode/.gitconfig-game 2>/dev/null || true'",
+  "remoteUser": "vscode",
+  "updateRemoteUserUID": true
+}

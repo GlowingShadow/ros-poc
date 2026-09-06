@@ -1,0 +1,17 @@
+services:
+  ros-poc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    gpus: all
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+    volumes:
+      - ..:/workspace:cached
+      # Mount host SSH keys and git configs at runtime.
+      # Uses ${HOME} on Linux/macOS or ${USERPROFILE} on Windows (set whichever applies).
+      - ${USERPROFILE}/.ssh:/tmp/host-ssh:ro
+      - ${USERPROFILE}/.gitconfig:/home/vscode/.gitconfig
+      - ${USERPROFILE}/.gitconfig-pro:/home/vscode/.gitconfig-pro
+      - ${USERPROFILE}/.gitconfig-game:/home/vscode/.gitconfig-game
+    command: ["tail", "-f", "/dev/null"]

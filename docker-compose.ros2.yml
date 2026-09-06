@@ -1,0 +1,59 @@
+# Kept separate from .devcontainer/docker-compose.yml so the existing
+# dev-shell devcontainer flow is never affected.
+# Bring the pipeline up with:
+#   MODE=copy docker compose -f docker-compose.ros2.yml up --build
+#   MODE=zero_copy docker compose -f docker-compose.ros2.yml up --build
+
+x-ros2-app: &ros2-app
+  build:
+    context: .
+    dockerfile: docker/ros2-app/Dockerfile
+  image: ros2-poc-app:latest
+  networks: [ros2net]
+  environment: &ros2-app-env
+    MODE: ${MODE:-copy}
+    ROS_DOMAIN_ID: "42"
+    RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+  volumes:
+    - .:/workspace:cached
+  restart: "no"
+
+services:
+  manager:
+    <<: *ros2-app
+    ipc: shareable
+    environment:
+      <<: *ros2-app-env
+      NODE_ROLE: manager
+    command: ["ros2", "run", "pipeline_apps", "manager_node"]
+
+  postprocessA:
+    <<: *ros2-app
+    ipc: service:manager
+    depends_on: [manager]
+    environment:
+      <<: *ros2-app-env
+      NODE_ROLE: postprocessA
+    command: ["ros2", "run", "pipeline_apps", "postprocess_node"]
+
+  postprocessB:
+    <<: *ros2-app
+    ipc: service:manager
+    depends_on: [manager]
+    environment:
+      <<: *ros2-app-env
+      NODE_ROLE: postprocessB
+    command: ["ros2", "run", "pipeline_apps", "postprocess_node"]
+
+  postprocessC:
+    <<: *ros2-app
+    ipc: service:manager
+    depends_on: [manager]
+    environment:
+      <<: *ros2-app-env
+      NODE_ROLE: postprocessC
+    command: ["ros2", "run", "pipeline_apps", "postprocess_node"]
+
+networks:
+  ros2net:
+    driver: bridge
