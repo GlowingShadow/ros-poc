@@ -1,0 +1,5 @@
+- create ros node from py code
+- no buffer for frames
+- keep only 1 frame
+- qos : keep last, best effort, durability volatile
+ 

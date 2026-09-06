@@ -14,6 +14,10 @@
   <depend>pipeline_interfaces</depend>
   <depend>python3-opencv</depend>
   <depend>python3-numpy</depend>
+  <depend>gstreamer1.0-tools</depend>
+  <depend>gstreamer1.0-plugins-base</depend>
+  <depend>gstreamer1.0-plugins-good</depend>
+  <depend>gstreamer1.0-plugins-bad</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

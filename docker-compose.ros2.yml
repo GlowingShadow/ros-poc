@@ -15,6 +15,15 @@ x-ros2-app: &ros2-app
     FORCE_REBUILD: ${FORCE_REBUILD:-0}
     ROS_DOMAIN_ID: "42"
     RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+    # Real video frame rate makes the postprocessB->postprocessC hop-delay
+    # simulation (meant for the static 5-image demo) fall further behind
+    # every frame; keep it near-zero so the live stream stays real-time.
+    MIN_PROCESSING_DELAY_S: ${MIN_PROCESSING_DELAY_S:-0.0}
+    MAX_PROCESSING_DELAY_S: ${MAX_PROCESSING_DELAY_S:-0.02}
+    # Only read by manager; harmless no-ops for postprocessA/B/C.
+    VIDEO_PATH: ${VIDEO_PATH:-/workspace/input/video_720.mp4}
+    GST_UDP_HOST: ${GST_UDP_HOST:-host.docker.internal}
+    GST_UDP_PORT: ${GST_UDP_PORT:-5000}
   volumes:
     - .:/workspace:cached
   restart: "no"
@@ -24,6 +33,15 @@ services:
     <<: *ros2-app
     ipc: shareable
     command: ["ros2", "run", "manager", "manager_node"]
+    # Lets manager reach a gst-launch-1.0 receiver run directly in the
+    # devcontainer shell: that shell is the Docker host for the nested
+    # dockerd running this stack, i.e. this container's host-gateway.
+    # Pinned to the literal IPv4 gateway (see the ros2net ipam config below)
+    # rather than the "host-gateway" magic string: on this nested dockerd
+    # that string resolves to an IPv6 address with no route on this
+    # network, silently black-holing every packet.
+    extra_hosts:
+      - "host.docker.internal:172.28.0.1"
     healthcheck:
       # All four services share the bind-mounted /workspace, and only
       # manager runs colcon build. postprocessA/B/C must wait for this
@@ -62,3 +80,7 @@ services:
 networks:
   ros2net:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1

@@ -20,14 +20,15 @@ manager ──new_frame────┤
   on `out_b`; `postprocessC` stamps its name and forwards the result on `out_c`
   back to the manager.
 
-`manager` generates a fixed set of sample frames (auto-generated placeholder
-images on first run if `sample_images/` is empty — drop your own images in
-there beforehand to skip generation) and sends them once. Each `postprocessX`
-sleeps for a random duration (fake processing). The manager considers a frame
-**done only when both** its final image (`out_c`) and its metadata
-(`metadata_a`) have come back; it verifies the image carries the two stamps
-`[postprocessB, postprocessC]`, saves it to `output_frames/`, and prints a
-per-frame latency + metadata summary.
+`manager` reads a video file (`input/video_720.mp4` by default — see
+`VIDEO_PATH` below) and publishes it frame-by-frame in real time, at the
+video's own frame rate. The manager considers a frame **done only when
+both** its final image (`out_c`) and its metadata (`metadata_a`) have come
+back; it then burns `frame_id` and `mean_brightness` onto the frame (on top
+of the `[postprocessB, postprocessC]` name stamps already on it) and streams
+it live over UDP via a `gst-launch-1.0` subprocess, instead of saving PNGs to
+disk. When the video ends, manager prints a per-frame latency + metadata
+summary and shuts down.
 
 Topics (bare names): `new_frame`, `metadata_a`, `out_b`, `out_c`, plus
 `control` (manager broadcasts the mode and RUN/STOP to A/B/C).
@@ -63,16 +64,65 @@ docker compose -f docker-compose.ros2.yml down
 MODE=zero_copy docker compose -f docker-compose.ros2.yml up --build
 ```
 
-`manager` exits once it has sent and collected back all sample frames;
-`postprocessA/B/C` keep running (stop the whole stack with
+`manager` exits once it has sent and collected back every frame of the
+video; `postprocessA/B/C` keep running (stop the whole stack with
 `docker compose -f docker-compose.ros2.yml down`).
+
+### Video streaming
+
+`manager` reads `VIDEO_PATH` (default `/workspace/input/video_720.mp4`,
+inside the repo-mounted `/workspace`) and streams the fully-processed result
+out over UDP as MJPEG-over-RTP (a raw JPEG frame can be larger than a single
+UDP datagram, hence RTP's fragmentation/reassembly) to `GST_UDP_HOST:GST_UDP_PORT`
+(defaults `host.docker.internal:5000` — the manager container's Docker
+host-gateway, i.e. this devcontainer shell).
+
+Env vars (all optional, set via `docker-compose.ros2.yml` or the shell
+environment before `docker compose up`):
+
+| Var | Default | Purpose |
+| --- | --- | --- |
+| `VIDEO_PATH` | `/workspace/input/video_720.mp4` | Source video read by `manager` |
+| `GST_UDP_HOST` | `host.docker.internal` | Where `manager`'s gst-launch sender sends the stream |
+| `GST_UDP_PORT` | `5000` | UDP port for the stream |
+| `MIN_PROCESSING_DELAY_S` / `MAX_PROCESSING_DELAY_S` | `0.0` / `0.02` | Simulated per-hop postprocess delay — kept near zero so the two-hop B→C chain can keep up with real video frame rate |
+
+To watch the stream, run a receiver directly in the devcontainer shell while
+the pipeline is up:
+
+```bash
+gst-launch-1.0 udpsrc port=5000 caps="application/x-rtp,encoding-name=JPEG,payload=26" ! \
+  rtpjitterbuffer ! rtpjpegdepay ! jpegdec ! videoconvert ! <your-sink-of-choice>
+```
+
+Swap `<your-sink-of-choice>` for whatever fits your setup, e.g.
+`autovideosink` if you have a display forwarded to this shell, or
+`filesink location=/workspace/output/stream.mjpeg` behind a muxer to save it
+and watch afterward. To just confirm packets are arriving with no display at
+all: `gst-launch-1.0 udpsrc port=5000 ! fakesink -v`.
+
+**Watching from outside the devcontainer** (e.g. VLC or gst-launch-1.0 on the
+Windows host): the devcontainer only *receives* the stream by default — it
+publishes no ports, and `manager`'s UDP send is unicast to one destination,
+so nothing outside can just "tune in". `scripts/relay-stream.sh` re-sends
+whatever arrives on `GST_UDP_PORT` (5000) on to a further destination
+(default: `host.docker.internal`, i.e. the Windows host, if you're on Docker
+Desktop). Run it in the devcontainer shell while the pipeline is up:
+
+```bash
+./scripts/relay-stream.sh                 # relay to host.docker.internal:5000
+./scripts/relay-stream.sh <host> <port>   # relay somewhere else
+```
+
+Then, on the receiving end, run the same `gst-launch-1.0` command shown
+above (adjusted for whatever GStreamer/VLC install is available there).
 
 ### Verifying the result
 
-- **Visual**: open `output_frames/frame_0_copy.png` … (or `_zero_copy.png`)
-  and confirm each image shows the original sample content plus 2 distinct,
-  non-overlapping name stamps: `postprocessB`, `postprocessC` (postprocessA
-  does not stamp — it only reports metadata).
+- **Visual**: receive the stream (see above) and confirm each frame shows
+  the two name stamps `postprocessB`/`postprocessC` (postprocessA does not
+  stamp — it only reports metadata) plus a third line burned in by
+  `manager` itself: `frame=<id> brightness=<mean_brightness>`.
 - **Metadata**: the `manager` log shows a `mean_brightness` and `WxH` per
   frame, reported by `postprocessA` over `metadata_a`.
 - **Latency**: compare the `manager` log's final summary table (columns
