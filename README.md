@@ -22,6 +22,17 @@ This pipeline runs in **separate containers** from the main dev-shell
 devcontainer (`.devcontainer/`), defined in `docker-compose.ros2.yml`, so it
 never affects the normal VS Code devcontainer flow.
 
+Each app is its own independent ROS2 package under `ros2_ws/src/`
+(`manager`, `postprocess_a`, `postprocess_b`, `postprocess_c`) with its own
+`package.xml`/`setup.py` and its own complete node implementation — as if
+written by 4 different people. The only thing they share is the
+`pipeline_interfaces` package (`Frame.msg`/`Control.msg`), which is the wire
+contract they all need to agree on to talk to each other; nothing else is
+shared, so image conversion/drawing/logging code is duplicated in each
+package rather than pulled from a common library. All 4 still build into and
+run from the **same Docker image** (`docker/ros2-app/Dockerfile`) — only the
+`command:` each container runs (`ros2 run <package> <node>`) differs.
+
 ### Usage
 
 Build the shared app image and bring the pipeline up in copy mode:

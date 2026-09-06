@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'pipeline_apps'
+package_name = 'postprocess_c'
 
 setup(
     name=package_name,
@@ -15,13 +15,12 @@ setup(
     zip_safe=True,
     maintainer='romainhoffschir',
     maintainer_email='romainhoffschir@gmail.com',
-    description='Manager + postprocess A/B/C nodes for the ROS2 zero-copy pipeline POC',
+    description='postprocessC node for the ROS2 zero-copy pipeline POC',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'manager_node = pipeline_apps.manager_node:main',
-            'postprocess_node = pipeline_apps.postprocess_node:main',
+            'postprocess_c_node = postprocess_c.postprocess_c_node:main',
         ],
     },
 )

@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>pipeline_apps</name>
+  <name>postprocess_c</name>
   <version>0.1.0</version>
-  <description>Manager + postprocess A/B/C nodes for the ROS2 zero-copy pipeline POC</description>
+  <description>postprocessC node for the ROS2 zero-copy pipeline POC</description>
   <maintainer email="romainhoffschir@gmail.com">romainhoffschir</maintainer>
   <license>Apache-2.0</license>
 

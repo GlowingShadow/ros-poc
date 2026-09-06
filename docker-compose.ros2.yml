@@ -22,37 +22,25 @@ services:
   manager:
     <<: *ros2-app
     ipc: shareable
-    environment:
-      <<: *ros2-app-env
-      NODE_ROLE: manager
-    command: ["ros2", "run", "pipeline_apps", "manager_node"]
+    command: ["ros2", "run", "manager", "manager_node"]
 
   postprocessA:
     <<: *ros2-app
     ipc: service:manager
     depends_on: [manager]
-    environment:
-      <<: *ros2-app-env
-      NODE_ROLE: postprocessA
-    command: ["ros2", "run", "pipeline_apps", "postprocess_node"]
+    command: ["ros2", "run", "postprocess_a", "postprocess_a_node"]
 
   postprocessB:
     <<: *ros2-app
     ipc: service:manager
     depends_on: [manager]
-    environment:
-      <<: *ros2-app-env
-      NODE_ROLE: postprocessB
-    command: ["ros2", "run", "pipeline_apps", "postprocess_node"]
+    command: ["ros2", "run", "postprocess_b", "postprocess_b_node"]
 
   postprocessC:
     <<: *ros2-app
     ipc: service:manager
     depends_on: [manager]
-    environment:
-      <<: *ros2-app-env
-      NODE_ROLE: postprocessC
-    command: ["ros2", "run", "pipeline_apps", "postprocess_node"]
+    command: ["ros2", "run", "postprocess_c", "postprocess_c_node"]
 
 networks:
   ros2net:
