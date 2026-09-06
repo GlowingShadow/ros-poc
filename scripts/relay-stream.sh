@@ -42,5 +42,13 @@ fi
 
 echo ">> relaying udp://0.0.0.0:$LISTEN_PORT -> udp://$DEST_HOST:$DEST_PORT"
 echo ">> on the receiving end, run:"
-echo "   gst-launch-1.0 udpsrc port=$DEST_PORT caps=\"application/x-rtp,encoding-name=JPEG,payload=26\" ! rtpjitterbuffer ! rtpjpegdepay ! jpegdec ! videoconvert ! autovideosink"
-exec gst-launch-1.0 -v udpsrc port="$LISTEN_PORT" ! udpsink host="$DEST_HOST" port="$DEST_PORT"
+echo "   gst-launch-1.0 udpsrc port=$DEST_PORT buffer-size=4194304 caps=\"application/x-rtp,encoding-name=JPEG,payload=26\" ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=500000000 ! rtpjitterbuffer ! rtpjpegdepay ! jpegdec ! videoconvert ! autovideosink"
+# buffer-size bumps SO_RCVBUF well past the OS default (~208KB), which is
+# too small to absorb one JPEG frame's worth of RTP packets landing in a
+# near-instantaneous burst -- the likely cause of the "RTP: missed N
+# packets" / "buffers being dropped" symptoms seen end-to-end. The queue
+# on this hop adds the same slack before re-sending, so a receive burst
+# here doesn't get squeezed back down to nothing before udpsink drains it.
+exec gst-launch-1.0 -v udpsrc port="$LISTEN_PORT" buffer-size=4194304 ! \
+  queue max-size-buffers=0 max-size-bytes=0 max-size-time=500000000 ! \
+  udpsink host="$DEST_HOST" port="$DEST_PORT"

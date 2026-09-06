@@ -13,14 +13,16 @@ the postprocess packages beyond the pipeline_interfaces message
 definitions.
 """
 import os
+import queue
 import subprocess
+import threading
 
 import cv2
 import numpy as np
 import rclpy
 from pipeline_interfaces.msg import Control, Frame, Metadata
 from rclpy.node import Node
-from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import Image
 
@@ -31,11 +33,49 @@ METADATA_A_TOPIC = 'metadata_a'
 # The image now only passes through B and C (A produces metadata, not a stamp).
 EXPECTED_STAMP_ORDER = ['postprocessB', 'postprocessC']
 DEFAULT_FPS = 30.0
+WORKER_POLL_TIMEOUT_S = 0.5
+# Logging every frame was fine for the original 5-image demo but at real
+# video frame rate it adds enough per-call overhead (console I/O, plus
+# rosout's own DDS publish) on the executor thread to slowly starve it —
+# only log a sample of frames on the hot path.
+LOG_EVERY_N_FRAMES = 30
+NEW_FRAME_SUBSCRIBERS_EXPECTED = 2  # postprocessA + postprocessB
+DISCOVERY_POLL_INTERVAL_S = 0.2
+DISCOVERY_MAX_WAIT_S = 30.0
+# postprocessB->postprocessC is a two-hop *serial* worker-thread chain; it
+# has a real, finite throughput ceiling regardless of the simulated delay
+# setting (message (de)serialization, numpy copies, cv2.putText per hop).
+# new_frame has no flow control of its own, so without a cap here manager
+# would keep publishing at the video's native rate even once the chain
+# falls behind, and the backlog (and therefore latency) grows without
+# bound. Pausing sends once too many frames are in flight paces the whole
+# pipeline to whatever it can actually sustain instead.
+MAX_IN_FLIGHT_FRAMES = 5
+# emitted_count is a simple counter, not a per-frame-id ledger, so a frame
+# that's lost for good (BEST_EFFORT QoS permits this, especially during
+# DDS discovery ramp-up right at startup) leaves a permanent gap: in_flight
+# never shrinks back down for it, and enough accumulated losses pin
+# in_flight at the cap forever with no way to recover. Expiring a pending
+# frame after this long makes a lost frame cost one timeout instead of
+# indefinitely eating into the in-flight budget.
+PENDING_FRAME_TIMEOUT_S = 2.0
 
 CONTROL_QOS = QoSProfile(
     depth=1,
     reliability=QoSReliabilityPolicy.RELIABLE,
     durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+)
+# Best-effort/volatile for the per-frame data: at real video frame rate, a
+# reliable publisher's retransmit/ack bookkeeping on repeated 2.7MB messages
+# adds overhead this pipeline doesn't need — dropping an occasional frame is
+# preferable to blocking on it. Every node touching new_frame/out_b/out_c/
+# metadata_a must use the same QoS, since a reliable subscriber can't match
+# a best-effort publisher.
+FRAME_QOS = QoSProfile(
+    depth=10,
+    history=QoSHistoryPolicy.KEEP_LAST,
+    reliability=QoSReliabilityPolicy.BEST_EFFORT,
+    durability=QoSDurabilityPolicy.VOLATILE,
 )
 
 
@@ -68,7 +108,10 @@ def elapsed_ms(now, stamp_msg):
 class ManagerNode(Node):
 
     def __init__(self):
-        super().__init__('manager')
+        # rosout mirrors every log call onto a DDS topic; at real video
+        # frame rate that's meaningful per-call overhead on the same
+        # executor thread that has to keep up with incoming frames.
+        super().__init__('manager', enable_rosout=False)
 
         self.mode = os.environ.get('MODE', 'copy')
         self.video_path = os.environ.get('VIDEO_PATH', '/workspace/input/video_720.mp4')
@@ -87,17 +130,28 @@ class ManagerNode(Node):
         estimated_frame_count = max(int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)), 0)
 
         self.gst_proc = self._start_gst_pipeline()
+        # gst-launch's stdin pipe is only ~64KB; writing a full 2.7MB raw
+        # frame blocks until gst-launch drains enough of it. Doing that
+        # write directly on a ROS callback would stall the whole executor
+        # (and therefore every incoming topic) for as long as encoding one
+        # frame takes, so a background worker thread owns the actual write
+        # -- same pattern postprocessB/C use for their fake-processing sleep.
+        self._gst_queue = queue.Queue()
+        self._gst_stop_event = threading.Event()
+        self._gst_worker_thread = threading.Thread(target=self._gst_worker_loop, daemon=True)
+        self._gst_worker_thread.start()
 
         self.control_pub = self.create_publisher(Control, CONTROL_TOPIC, CONTROL_QOS)
-        self.frame_pub = self.create_publisher(Frame, NEW_FRAME_TOPIC, 10)
-        self.create_subscription(Frame, OUT_C_TOPIC, self.on_final_frame, 10)
-        self.create_subscription(Metadata, METADATA_A_TOPIC, self.on_metadata, 10)
+        self.frame_pub = self.create_publisher(Frame, NEW_FRAME_TOPIC, FRAME_QOS)
+        self.create_subscription(Frame, OUT_C_TOPIC, self.on_final_frame, FRAME_QOS)
+        self.create_subscription(Metadata, METADATA_A_TOPIC, self.on_metadata, FRAME_QOS)
 
         # Per frame_id: holds whichever of {'image', 'meta'} has arrived so
         # far. A frame is only burned-in and streamed once both are present,
         # since arrival order between the metadata branch (A) and the image
         # chain (B->C) isn't guaranteed.
         self.pending = {}
+        self.sent_at = {}  # frame_id -> Time, for expiring stale pending entries
         self.image_results = {}
         self.metadata_results = {}
         self.emitted_count = 0
@@ -110,11 +164,16 @@ class ManagerNode(Node):
             f'manager starting, mode={self.mode}, video={self.video_path} '
             f'{self.width}x{self.height}@{self.fps:.2f}fps '
             f'(~{estimated_frame_count} frames estimated)')
-        # Wait a beat before the first send so DDS discovery across the
-        # containers has time to settle; use a one-shot timer (not
-        # time.sleep) so the executor stays responsive the whole time.
-        self.startup_timer = self.create_timer(2.0, self._on_startup_timer)
         self._estimated_frame_count = estimated_frame_count
+        # Wait for postprocessA/B to actually subscribe before sending
+        # anything, rather than guessing a fixed delay: a frame published
+        # before subscribers exist is silently dropped (default QoS is
+        # VOLATILE), and with the in-flight cap below, even ONE dropped
+        # frame near the start would stall the whole pipeline forever
+        # waiting for it to "complete".
+        self._discovery_start = self.get_clock().now()
+        self.discovery_timer = self.create_timer(
+            DISCOVERY_POLL_INTERVAL_S, self._on_discovery_check)
 
     def _start_gst_pipeline(self):
         cmd = [
@@ -136,8 +195,20 @@ class ManagerNode(Node):
         self.get_logger().info(f"starting gst pipeline: {' '.join(cmd)}")
         return subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
-    def _on_startup_timer(self):
-        self.startup_timer.cancel()
+    def _on_discovery_check(self):
+        matched = self.frame_pub.get_subscription_count()
+        waited_s = (self.get_clock().now() - self._discovery_start).nanoseconds / 1e9
+        if matched < NEW_FRAME_SUBSCRIBERS_EXPECTED and waited_s < DISCOVERY_MAX_WAIT_S:
+            return  # keep polling
+        self.discovery_timer.cancel()
+        if matched < NEW_FRAME_SUBSCRIBERS_EXPECTED:
+            self.get_logger().warning(
+                f'timed out waiting for new_frame subscribers '
+                f'({matched}/{NEW_FRAME_SUBSCRIBERS_EXPECTED} after {waited_s:.1f}s); '
+                f'starting anyway')
+        else:
+            self.get_logger().info(f'new_frame subscribers ready after {waited_s:.1f}s')
+
         control_msg = Control(
             mode=self.mode, command=Control.RUN, total_frames=self._estimated_frame_count)
         self.control_pub.publish(control_msg)
@@ -146,6 +217,11 @@ class ManagerNode(Node):
         self.send_timer = self.create_timer(self.send_interval_s, self._on_send_timer)
 
     def _on_send_timer(self):
+        self._expire_stale_pending()
+        in_flight = self._next_frame_index - self.emitted_count
+        if in_flight >= MAX_IN_FLIGHT_FRAMES:
+            return  # postprocess chain hasn't caught up yet; wait for the next tick
+
         ret, img = self.cap.read()
         if not ret:
             self.send_timer.cancel()
@@ -163,9 +239,22 @@ class ManagerNode(Node):
             origin_stamp=stamp, hop_stamp=stamp)
         frame_msg.image = image_to_msg(img)
         self.frame_pub.publish(frame_msg)
-        self.get_logger().info(f'sent frame_id={frame_id} mode={self.mode}')
+        self.sent_at[frame_id] = self.get_clock().now()
+        if frame_id % LOG_EVERY_N_FRAMES == 0:
+            self.get_logger().info(f'sent frame_id={frame_id} mode={self.mode}')
 
         self._next_frame_index += 1
+
+    def _expire_stale_pending(self):
+        now = self.get_clock().now()
+        for frame_id, sent_time in list(self.sent_at.items()):
+            if frame_id in self.pending and (now - sent_time).nanoseconds / 1e9 > PENDING_FRAME_TIMEOUT_S:
+                self.get_logger().warning(
+                    f'frame_id={frame_id} incomplete after {PENDING_FRAME_TIMEOUT_S}s '
+                    f'(likely dropped under best-effort QoS); giving up on it')
+                del self.pending[frame_id]
+                del self.sent_at[frame_id]
+                self.emitted_count += 1
 
     def on_final_frame(self, msg):
         entry = self.pending.setdefault(msg.frame_id, {})
@@ -176,10 +265,11 @@ class ManagerNode(Node):
         transport_ms = elapsed_ms(t_recv, msg.hop_stamp)
         ring_total_ms = elapsed_ms(t_recv, msg.origin_stamp)
         ok = list(msg.stamped_by) == EXPECTED_STAMP_ORDER
-        self.get_logger().info(
-            f'[manager] image frame_id={msg.frame_id} mode={msg.mode} '
-            f'transport_ms={transport_ms:.1f} ring_total_ms={ring_total_ms:.1f} '
-            f"{'PASS' if ok else 'FAIL'} stamped_by={list(msg.stamped_by)}")
+        if msg.frame_id % LOG_EVERY_N_FRAMES == 0:
+            self.get_logger().info(
+                f'[manager] image frame_id={msg.frame_id} mode={msg.mode} '
+                f'transport_ms={transport_ms:.1f} ring_total_ms={ring_total_ms:.1f} '
+                f"{'PASS' if ok else 'FAIL'} stamped_by={list(msg.stamped_by)}")
 
         entry['image'] = msg_to_image(msg.image)
         entry['image_stats'] = {
@@ -194,10 +284,11 @@ class ManagerNode(Node):
 
         t_recv = self.get_clock().now()
         transport_ms = elapsed_ms(t_recv, msg.hop_stamp)
-        self.get_logger().info(
-            f'[manager] metadata frame_id={msg.frame_id} mode={msg.mode} '
-            f'transport_ms={transport_ms:.1f} {msg.width}x{msg.height} '
-            f'mean_brightness={msg.mean_brightness:.1f}')
+        if msg.frame_id % LOG_EVERY_N_FRAMES == 0:
+            self.get_logger().info(
+                f'[manager] metadata frame_id={msg.frame_id} mode={msg.mode} '
+                f'transport_ms={transport_ms:.1f} {msg.width}x{msg.height} '
+                f'mean_brightness={msg.mean_brightness:.1f}')
 
         entry['meta'] = {
             'transport_ms': transport_ms,
@@ -212,14 +303,12 @@ class ManagerNode(Node):
             return
 
         img = burn_metadata_on_frame(entry['image'], frame_id, entry['meta']['mean_brightness'])
-        try:
-            self.gst_proc.stdin.write(img.tobytes())
-        except (BrokenPipeError, ValueError):
-            self.get_logger().warning(f'gst pipeline stdin closed; frame_id={frame_id} dropped')
+        self._gst_queue.put(img)
 
         self.image_results[frame_id] = entry['image_stats']
         self.metadata_results[frame_id] = entry['meta']
         del self.pending[frame_id]
+        self.sent_at.pop(frame_id, None)
         self.emitted_count += 1
         self._maybe_finish()
 
@@ -256,9 +345,24 @@ class ManagerNode(Node):
         if rclpy.ok():
             rclpy.shutdown()
 
+    def _gst_worker_loop(self):
+        # Keep draining even after stop is requested, so frames already
+        # queued by the time shutdown starts still reach gst-launch.
+        while not self._gst_stop_event.is_set() or not self._gst_queue.empty():
+            try:
+                img = self._gst_queue.get(timeout=WORKER_POLL_TIMEOUT_S)
+            except queue.Empty:
+                continue
+            try:
+                self.gst_proc.stdin.write(img.tobytes())
+            except (BrokenPipeError, ValueError):
+                self.get_logger().warning('gst pipeline stdin closed; frame dropped')
+
     def stop_gst(self):
         if self.gst_proc is None:
             return
+        self._gst_stop_event.set()
+        self._gst_worker_thread.join()
         try:
             if self.gst_proc.stdin:
                 self.gst_proc.stdin.close()

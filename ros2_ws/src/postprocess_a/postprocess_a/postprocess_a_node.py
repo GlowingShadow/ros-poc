@@ -19,7 +19,7 @@ import numpy as np
 import rclpy
 from pipeline_interfaces.msg import Control, Frame, Metadata
 from rclpy.node import Node
-from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.time import Time
 
 ROLE = 'postprocessA'
@@ -32,6 +32,18 @@ CONTROL_QOS = QoSProfile(
     depth=1,
     reliability=QoSReliabilityPolicy.RELIABLE,
     durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+)
+# Best-effort/volatile for the per-frame data: at real video frame rate, a
+# reliable publisher's retransmit/ack bookkeeping on repeated 2.7MB messages
+# adds overhead this pipeline doesn't need — dropping an occasional frame is
+# preferable to blocking on it. Every node touching new_frame/out_b/out_c/
+# metadata_a must use the same QoS, since a reliable subscriber can't match
+# a best-effort publisher.
+FRAME_QOS = QoSProfile(
+    depth=10,
+    history=QoSHistoryPolicy.KEEP_LAST,
+    reliability=QoSReliabilityPolicy.BEST_EFFORT,
+    durability=QoSDurabilityPolicy.VOLATILE,
 )
 
 
@@ -57,8 +69,8 @@ class PostprocessANode(Node):
         self.max_delay_s = float(os.environ.get('MAX_PROCESSING_DELAY_S', '0.6'))
 
         self.create_subscription(Control, CONTROL_TOPIC, self.on_control, CONTROL_QOS)
-        self.publisher = self.create_publisher(Metadata, OUT_TOPIC, 10)
-        self.create_subscription(Frame, IN_TOPIC, self.on_frame, 10)
+        self.publisher = self.create_publisher(Metadata, OUT_TOPIC, FRAME_QOS)
+        self.create_subscription(Frame, IN_TOPIC, self.on_frame, FRAME_QOS)
 
         self._work_queue = queue.Queue()
         self._stop_event = threading.Event()

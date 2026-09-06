@@ -91,15 +91,29 @@ To watch the stream, run a receiver directly in the devcontainer shell while
 the pipeline is up:
 
 ```bash
-gst-launch-1.0 udpsrc port=5000 caps="application/x-rtp,encoding-name=JPEG,payload=26" ! \
+gst-launch-1.0 udpsrc port=5000 buffer-size=4194304 caps="application/x-rtp,encoding-name=JPEG,payload=26" ! \
   rtpjitterbuffer ! rtpjpegdepay ! jpegdec ! videoconvert ! <your-sink-of-choice>
 ```
+
+`buffer-size` (bytes) raises the socket's receive buffer well past the OS
+default (~208KB) — each JPEG frame arrives as a burst of dozens of RTP
+packets in a few milliseconds, which is enough to overflow a small buffer
+and show up downstream as `RTP: missed N packets` / dropped frames. If
+you're going through `relay-stream.sh` (see below), that extra hop makes
+this worse, since it's another receive-burst-then-resend-burst cycle.
 
 Swap `<your-sink-of-choice>` for whatever fits your setup, e.g.
 `autovideosink` if you have a display forwarded to this shell, or
 `filesink location=/workspace/output/stream.mjpeg` behind a muxer to save it
 and watch afterward. To just confirm packets are arriving with no display at
 all: `gst-launch-1.0 udpsrc port=5000 ! fakesink -v`.
+
+If you're receiving with `ffplay`/`docs/stream.sdp` instead, pass the same
+kind of buffer headroom via `-buffer_size` and give the RTP reorder logic
+more slack with `-max_delay`:
+```
+ffplay -protocol_whitelist file,udp,rtp -buffer_size 4194304 -max_delay 1000000 -i docs\stream.sdp
+```
 
 **Watching from outside the devcontainer** (e.g. VLC or gst-launch-1.0 on the
 Windows host): the devcontainer only *receives* the stream by default — it
