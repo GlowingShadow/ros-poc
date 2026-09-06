@@ -24,23 +24,39 @@ services:
     <<: *ros2-app
     ipc: shareable
     command: ["ros2", "run", "manager", "manager_node"]
+    healthcheck:
+      # All four services share the bind-mounted /workspace, and only
+      # manager runs colcon build. postprocessA/B/C must wait for this
+      # build to finish (not just for the container to start) or they
+      # race manager's colcon build and corrupt the shared build/install dirs.
+      test: ["CMD-SHELL", "test -f /workspace/ros2_ws/install/setup.bash"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 5s
 
   postprocessA:
     <<: *ros2-app
     ipc: service:manager
-    depends_on: [manager]
+    depends_on:
+      manager:
+        condition: service_healthy
     command: ["ros2", "run", "postprocess_a", "postprocess_a_node"]
 
   postprocessB:
     <<: *ros2-app
     ipc: service:manager
-    depends_on: [manager]
+    depends_on:
+      manager:
+        condition: service_healthy
     command: ["ros2", "run", "postprocess_b", "postprocess_b_node"]
 
   postprocessC:
     <<: *ros2-app
     ipc: service:manager
-    depends_on: [manager]
+    depends_on:
+      manager:
+        condition: service_healthy
     command: ["ros2", "run", "postprocess_c", "postprocess_c_node"]
 
 networks:

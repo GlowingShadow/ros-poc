@@ -10,9 +10,9 @@ RUN apt-get update && \
 
 WORKDIR /workspace
 
-COPY entrypoint.sh /entrypoint.sh
-COPY fastdds_profiles_copy.xml /ros2_ws/fastdds_profiles_copy.xml
-COPY fastdds_profiles_zero_copy.xml /ros2_ws/fastdds_profiles_zero_copy.xml
+COPY docker/ros2-app/entrypoint.sh /entrypoint.sh
+COPY docker/ros2-app/fastdds_profiles_copy.xml /ros2_ws/fastdds_profiles_copy.xml
+COPY docker/ros2-app/fastdds_profiles_zero_copy.xml /ros2_ws/fastdds_profiles_zero_copy.xml
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
