@@ -220,9 +220,12 @@ __marimo__/
 # ROS2 pipeline POC
 ros2_ws/install/
 ros2_ws/log/
-sample_images/*.png
-sample_images/*.jpg
-sample_images/*.jpeg
-output_frames/*.png
-!sample_images/.gitkeep
-!output_frames/.gitkeep
+input/*.png
+input/*.jpg
+input/*.jpeg
+input/*.mp4
+!input/.gitkeep
+
+# deprecated image pipeline
+output/*.png
+!output/.gitkeep
