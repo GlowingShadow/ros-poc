@@ -3,9 +3,16 @@ arbitrary duration (fake processing), stamps 'postprocessB' onto the frame,
 and forwards it to /pipeline/frame_to_c. Fully self-contained: no shared code
 with manager/postprocess_a/postprocess_c beyond the pipeline_interfaces
 message definitions.
+
+The ROS callback (on_frame) only enqueues work; a background worker thread
+does the actual (slow, fake) processing and publishes the result, so the
+executor thread stays free to service other callbacks (e.g. on_control)
+while a frame is being processed.
 """
 import os
+import queue
 import random
+import threading
 import time
 
 import cv2
@@ -22,6 +29,7 @@ IN_TOPIC = '/pipeline/frame_to_b'
 OUT_TOPIC = '/pipeline/frame_to_c'
 CONTROL_TOPIC = '/pipeline/control'
 STAMP_SLOT = 1
+WORKER_POLL_TIMEOUT_S = 0.5
 
 CONTROL_QOS = QoSProfile(
     depth=1,
@@ -72,6 +80,11 @@ class PostprocessBNode(Node):
         self.publisher = self.create_publisher(Frame, OUT_TOPIC, 10)
         self.create_subscription(Frame, IN_TOPIC, self.on_frame, 10)
 
+        self._work_queue = queue.Queue()
+        self._stop_event = threading.Event()
+        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker_thread.start()
+
         self.get_logger().info(f'{ROLE} ready, mode={self.mode}, in={IN_TOPIC}, out={OUT_TOPIC}')
 
     def on_control(self, msg):
@@ -80,7 +93,21 @@ class PostprocessBNode(Node):
         self.get_logger().info(f'control: mode={msg.mode} command={command}')
 
     def on_frame(self, msg):
+        # Runs on the executor thread: capture the receive timestamp (this is
+        # what transport_ms is measured from) and hand off immediately so the
+        # executor is never blocked by the fake-processing sleep below.
         t_recv = self.get_clock().now()
+        self._work_queue.put((msg, t_recv))
+
+    def _worker_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                msg, t_recv = self._work_queue.get(timeout=WORKER_POLL_TIMEOUT_S)
+            except queue.Empty:
+                continue
+            self._process_frame(msg, t_recv)
+
+    def _process_frame(self, msg, t_recv):
         img = msg_to_image(msg.image)
 
         delay = random_processing_delay(self.min_delay_s, self.max_delay_s)
@@ -107,6 +134,10 @@ class PostprocessBNode(Node):
             f'transport_ms={transport_ms:.1f} hop_total_ms={hop_total_ms:.1f} '
             f'ring_total_ms={ring_total_ms:.1f}')
 
+    def stop_worker(self):
+        self._stop_event.set()
+        self._worker_thread.join()
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -116,6 +147,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        node.stop_worker()
         node.destroy_node()
         rclpy.shutdown()
 
