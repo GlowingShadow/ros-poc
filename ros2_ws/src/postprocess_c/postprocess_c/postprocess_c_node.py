@@ -1,6 +1,6 @@
-"""postprocessC: receives frames on /pipeline/frame_to_c, sleeps for an
+"""postprocessC: receives frames on out_b, sleeps for an
 arbitrary duration (fake processing), stamps 'postprocessC' onto the frame,
-and forwards it to /pipeline/frame_from_c. Fully self-contained: no shared
+and forwards it to out_c. Fully self-contained: no shared
 code with manager/postprocess_a/postprocess_b beyond the pipeline_interfaces
 message definitions.
 
@@ -25,10 +25,10 @@ from rclpy.time import Time
 from sensor_msgs.msg import Image
 
 ROLE = 'postprocessC'
-IN_TOPIC = '/pipeline/frame_to_c'
-OUT_TOPIC = '/pipeline/frame_from_c'
-CONTROL_TOPIC = '/pipeline/control'
-STAMP_SLOT = 2
+IN_TOPIC = 'out_b'
+OUT_TOPIC = 'out_c'
+CONTROL_TOPIC = 'control'
+STAMP_SLOT = 1
 WORKER_POLL_TIMEOUT_S = 0.5
 
 CONTROL_QOS = QoSProfile(

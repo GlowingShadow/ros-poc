@@ -1,23 +1,31 @@
-"""manager: generates the sample frame set, sends it once through the ring
-(manager -> postprocessA -> postprocessB -> postprocessC -> manager), and
-verifies/logs the result. Fully self-contained: no shared code with the
-postprocess packages beyond the pipeline_interfaces message definitions.
+"""manager: generates the sample frame set and publishes it once on
+new_frame, which fans out to two branches:
+
+    manager --new_frame--> postprocessA --metadata_a--> manager   (metadata branch)
+    manager --new_frame--> postprocessB --out_b--> postprocessC --out_c--> manager  (image chain)
+
+The manager collects BOTH the final stamped image (out_c) and the metadata
+(metadata_a) per frame, and considers a frame done only when both have
+arrived. Fully self-contained: no shared code with the postprocess packages
+beyond the pipeline_interfaces message definitions.
 """
 import os
 
 import cv2
 import numpy as np
 import rclpy
-from pipeline_interfaces.msg import Control, Frame
+from pipeline_interfaces.msg import Control, Frame, Metadata
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import Image
 
-CONTROL_TOPIC = '/pipeline/control'
-OUT_TOPIC = '/pipeline/frame_to_a'
-IN_TOPIC = '/pipeline/frame_from_c'
-EXPECTED_STAMP_ORDER = ['postprocessA', 'postprocessB', 'postprocessC']
+CONTROL_TOPIC = 'control'
+NEW_FRAME_TOPIC = 'new_frame'
+OUT_C_TOPIC = 'out_c'
+METADATA_A_TOPIC = 'metadata_a'
+# The image now only passes through B and C (A produces metadata, not a stamp).
+EXPECTED_STAMP_ORDER = ['postprocessB', 'postprocessC']
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg')
 
 CONTROL_QOS = QoSProfile(
@@ -105,18 +113,23 @@ class ManagerNode(Node):
         os.makedirs(self.output_dir, exist_ok=True)
 
         self.control_pub = self.create_publisher(Control, CONTROL_TOPIC, CONTROL_QOS)
-        self.frame_pub = self.create_publisher(Frame, OUT_TOPIC, 10)
-        self.create_subscription(Frame, IN_TOPIC, self.on_final_frame, 10)
+        self.frame_pub = self.create_publisher(Frame, NEW_FRAME_TOPIC, 10)
+        self.create_subscription(Frame, OUT_C_TOPIC, self.on_final_frame, 10)
+        self.create_subscription(Metadata, METADATA_A_TOPIC, self.on_metadata, 10)
 
-        self.pending = set(range(len(self.images)))
-        self.results = {}
+        # A frame is "done" only when BOTH the image (out_c) and the metadata
+        # (metadata_a) have come back for it.
+        self.pending_image = set(range(len(self.images)))
+        self.pending_metadata = set(range(len(self.images)))
+        self.image_results = {}
+        self.metadata_results = {}
         self.timeout_timer = None
         self.send_timer = None
         self._next_frame_index = 0
 
         self.get_logger().info(
             f'manager starting, mode={self.mode}, {len(self.images)} sample image(s)')
-        # Wait a beat before the first send so DDS discovery across the 4
+        # Wait a beat before the first send so DDS discovery across the
         # containers has time to settle; use a one-shot timer (not
         # time.sleep) so the executor stays responsive the whole time.
         self.startup_timer = self.create_timer(2.0, self._on_startup_timer)
@@ -125,8 +138,8 @@ class ManagerNode(Node):
         self.startup_timer.cancel()
         control_msg = Control(mode=self.mode, command=Control.RUN, total_frames=len(self.images))
         self.control_pub.publish(control_msg)
-        # One frame per timer tick (not a sleep loop) so on_final_frame
-        # callbacks for early frames are never stuck behind later sends.
+        # One frame per timer tick (not a sleep loop) so return callbacks for
+        # early frames are never stuck behind later sends.
         self.send_timer = self.create_timer(self.send_interval_s, self._on_send_timer)
 
     def _on_send_timer(self):
@@ -145,46 +158,71 @@ class ManagerNode(Node):
             self.timeout_timer = self.create_timer(self.timeout_s, self._on_timeout)
 
     def on_final_frame(self, msg):
-        if msg.frame_id not in self.pending:
+        if msg.frame_id not in self.pending_image:
             return  # already handled (or unexpected re-delivery); ignore
 
         t_recv = self.get_clock().now()
         transport_ms = elapsed_ms(t_recv, msg.hop_stamp)
         ring_total_ms = elapsed_ms(t_recv, msg.origin_stamp)
-        self.get_logger().info(
-            f'[manager] frame_id={msg.frame_id} mode={msg.mode} '
-            f'transport_ms={transport_ms:.1f} ring_total_ms={ring_total_ms:.1f}')
-
         ok = list(msg.stamped_by) == EXPECTED_STAMP_ORDER
         self.get_logger().info(
-            f"frame_id={msg.frame_id} {'PASS' if ok else 'FAIL'} stamped_by={list(msg.stamped_by)}")
+            f'[manager] image frame_id={msg.frame_id} mode={msg.mode} '
+            f'transport_ms={transport_ms:.1f} ring_total_ms={ring_total_ms:.1f} '
+            f"{'PASS' if ok else 'FAIL'} stamped_by={list(msg.stamped_by)}")
 
         img = msg_to_image(msg.image)
         out_path = os.path.join(self.output_dir, f'frame_{msg.frame_id}_{msg.mode}.png')
         save_image(out_path, img)
 
-        self.results[msg.frame_id] = {
+        self.image_results[msg.frame_id] = {
             'transport_ms': transport_ms, 'ring_total_ms': ring_total_ms, 'ok': ok,
         }
-        self.pending.discard(msg.frame_id)
+        self.pending_image.discard(msg.frame_id)
+        self._maybe_finish()
 
-        if not self.pending:
+    def on_metadata(self, msg):
+        if msg.frame_id not in self.pending_metadata:
+            return  # already handled (or unexpected re-delivery); ignore
+
+        t_recv = self.get_clock().now()
+        transport_ms = elapsed_ms(t_recv, msg.hop_stamp)
+        self.get_logger().info(
+            f'[manager] metadata frame_id={msg.frame_id} mode={msg.mode} '
+            f'transport_ms={transport_ms:.1f} {msg.width}x{msg.height} '
+            f'mean_brightness={msg.mean_brightness:.1f}')
+
+        self.metadata_results[msg.frame_id] = {
+            'transport_ms': transport_ms,
+            'width': msg.width, 'height': msg.height,
+            'mean_brightness': msg.mean_brightness,
+        }
+        self.pending_metadata.discard(msg.frame_id)
+        self._maybe_finish()
+
+    def _maybe_finish(self):
+        if not self.pending_image and not self.pending_metadata:
             if self.timeout_timer is not None:
                 self.timeout_timer.cancel()
             self.print_summary()
 
     def print_summary(self):
         self.get_logger().info('=== summary ===')
-        self.get_logger().info('frame_id | transport_ms | ring_total_ms | status')
-        for frame_id in sorted(self.results):
-            r = self.results[frame_id]
-            self.get_logger().info(
-                f"{frame_id:>8} | {r['transport_ms']:>12.1f} | "
-                f"{r['ring_total_ms']:>13.1f} | {'PASS' if r['ok'] else 'FAIL'}")
-        avg_transport = sum(r['transport_ms'] for r in self.results.values()) / len(self.results)
-        avg_total = sum(r['ring_total_ms'] for r in self.results.values()) / len(self.results)
         self.get_logger().info(
-            f'average transport_ms={avg_transport:.1f} average ring_total_ms={avg_total:.1f}')
+            'frame_id | img_transport_ms | ring_total_ms | status | '
+            'meta_transport_ms | mean_brightness')
+        for frame_id in sorted(self.image_results):
+            r = self.image_results[frame_id]
+            m = self.metadata_results.get(frame_id, {})
+            self.get_logger().info(
+                f"{frame_id:>8} | {r['transport_ms']:>16.1f} | "
+                f"{r['ring_total_ms']:>13.1f} | {'PASS' if r['ok'] else 'FAIL':>6} | "
+                f"{m.get('transport_ms', float('nan')):>17.1f} | "
+                f"{m.get('mean_brightness', float('nan')):>15.1f}")
+        avg_transport = sum(r['transport_ms'] for r in self.image_results.values()) / len(self.image_results)
+        avg_total = sum(r['ring_total_ms'] for r in self.image_results.values()) / len(self.image_results)
+        self.get_logger().info(
+            f'average image transport_ms={avg_transport:.1f} '
+            f'average ring_total_ms={avg_total:.1f}')
 
         stop_msg = Control(mode=self.mode, command=Control.STOP, total_frames=len(self.images))
         self.control_pub.publish(stop_msg)
@@ -195,8 +233,10 @@ class ManagerNode(Node):
 
     def _on_timeout(self):
         self.timeout_timer.cancel()
-        if self.pending:
-            self.get_logger().warning(f'timed out waiting for frame_id(s): {sorted(self.pending)}')
+        if self.pending_image or self.pending_metadata:
+            self.get_logger().warning(
+                f'timed out; missing image frame_id(s)={sorted(self.pending_image)} '
+                f'metadata frame_id(s)={sorted(self.pending_metadata)}')
 
 
 def main(args=None):
