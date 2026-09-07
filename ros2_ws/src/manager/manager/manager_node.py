@@ -109,8 +109,14 @@ def msg_to_image(msg):
 
 
 def burn_metadata_on_frame(img, frame_id, mean_brightness):
+    # Split across two lines rather than one "label: text" line -- at this
+    # font scale the combined string renders ~1494px wide, wider than the
+    # 1280px frame, and would run off the right edge.
+    label = 'manager (from postprocessA)'
     text = f'frame={frame_id} brightness={mean_brightness:.1f}'
-    cv2.putText(img, text, (30, 180), cv2.FONT_HERSHEY_SIMPLEX,
+    cv2.putText(img, label, (30, 180), cv2.FONT_HERSHEY_SIMPLEX,
+                1.5, (0, 255, 255), 3, cv2.LINE_AA)
+    cv2.putText(img, text, (30, 225), cv2.FONT_HERSHEY_SIMPLEX,
                 1.5, (0, 255, 255), 3, cv2.LINE_AA)
     return img
 
