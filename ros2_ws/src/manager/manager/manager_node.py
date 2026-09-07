@@ -44,21 +44,23 @@ DISCOVERY_POLL_INTERVAL_S = 0.2
 DISCOVERY_MAX_WAIT_S = 30.0
 # postprocessB->postprocessC is a two-hop *serial* worker-thread chain; it
 # has a real, finite throughput ceiling regardless of the simulated delay
-# setting (message (de)serialization, numpy copies, cv2.putText per hop).
-# new_frame has no flow control of its own, so without a cap here manager
-# would keep publishing at the video's native rate even once the chain
-# falls behind, and the backlog (and therefore latency) grows without
-# bound. Pausing sends once too many frames are in flight paces the whole
-# pipeline to whatever it can actually sustain instead.
-MAX_IN_FLIGHT_FRAMES = 5
-# emitted_count is a simple counter, not a per-frame-id ledger, so a frame
-# that's lost for good (BEST_EFFORT QoS permits this, especially during
-# DDS discovery ramp-up right at startup) leaves a permanent gap: in_flight
-# never shrinks back down for it, and enough accumulated losses pin
-# in_flight at the cap forever with no way to recover. Expiring a pending
-# frame after this long makes a lost frame cost one timeout instead of
-# indefinitely eating into the in-flight budget.
-PENDING_FRAME_TIMEOUT_S = 2.0
+# setting (message (de)serialization, numpy copies, cv2.putText per hop) --
+# it can't sustain the video's native rate. This is a LIVE feed, so the
+# right response to that is to drop the excess at the source, not to pause
+# sending and wait: pausing just turns the same throughput gap into visible
+# stutter instead of latency. cap.read() still advances every tick either
+# way, so the video stays locked to real elapsed time -- falling behind
+# means skipping ahead in content, never slowing down to catch up.
+# MAX_PENDING_BACKLOG bounds how many *sent* frames may be unresolved at
+# once before new frames stop being published at all (silently skipped,
+# not queued for later).
+MAX_PENDING_BACKLOG = 6
+# Pure garbage collection now, not a latency-critical unblock: a frame
+# that's lost for good (BEST_EFFORT QoS permits this) would otherwise sit
+# in `pending` forever, permanently inflating the backlog count used above.
+# Since nothing waits on this anymore, its only job is keeping that count
+# accurate over a long run -- it has no effect on playback smoothness.
+PENDING_FRAME_TIMEOUT_S = 1.0
 
 CONTROL_QOS = QoSProfile(
     depth=1,
@@ -97,7 +99,8 @@ def msg_to_image(msg):
 
 def burn_metadata_on_frame(img, frame_id, mean_brightness):
     text = f'frame={frame_id} brightness={mean_brightness:.1f}'
-    cv2.putText(img, text, (30, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 3, cv2.LINE_AA)
+    cv2.putText(img, text, (30, 180), cv2.FONT_HERSHEY_SIMPLEX,
+                1.5, (0, 255, 255), 3, cv2.LINE_AA)
     return img
 
 
@@ -114,8 +117,10 @@ class ManagerNode(Node):
         super().__init__('manager', enable_rosout=False)
 
         self.mode = os.environ.get('MODE', 'copy')
-        self.video_path = os.environ.get('VIDEO_PATH', '/workspace/input/video_720.mp4')
-        self.gst_udp_host = os.environ.get('GST_UDP_HOST', 'host.docker.internal')
+        self.video_path = os.environ.get(
+            'VIDEO_PATH', '/workspace/input/video_720.mp4')
+        self.gst_udp_host = os.environ.get(
+            'GST_UDP_HOST', 'host.docker.internal')
         self.gst_udp_port = int(os.environ.get('GST_UDP_PORT', '5000'))
         self.timeout_s = float(os.environ.get('COLLECT_TIMEOUT_S', '30.0'))
 
@@ -127,7 +132,8 @@ class ManagerNode(Node):
         fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.fps = fps if fps and fps > 1e-3 else DEFAULT_FPS
         self.send_interval_s = 1.0 / self.fps
-        estimated_frame_count = max(int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)), 0)
+        estimated_frame_count = max(
+            int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)), 0)
 
         self.gst_proc = self._start_gst_pipeline()
         # gst-launch's stdin pipe is only ~64KB; writing a full 2.7MB raw
@@ -138,27 +144,42 @@ class ManagerNode(Node):
         # -- same pattern postprocessB/C use for their fake-processing sleep.
         self._gst_queue = queue.Queue()
         self._gst_stop_event = threading.Event()
-        self._gst_worker_thread = threading.Thread(target=self._gst_worker_loop, daemon=True)
+        self._gst_worker_thread = threading.Thread(
+            target=self._gst_worker_loop, daemon=True)
         self._gst_worker_thread.start()
 
-        self.control_pub = self.create_publisher(Control, CONTROL_TOPIC, CONTROL_QOS)
-        self.frame_pub = self.create_publisher(Frame, NEW_FRAME_TOPIC, FRAME_QOS)
-        self.create_subscription(Frame, OUT_C_TOPIC, self.on_final_frame, FRAME_QOS)
-        self.create_subscription(Metadata, METADATA_A_TOPIC, self.on_metadata, FRAME_QOS)
+        self.control_pub = self.create_publisher(
+            Control, CONTROL_TOPIC, CONTROL_QOS)
+        self.frame_pub = self.create_publisher(
+            Frame, NEW_FRAME_TOPIC, FRAME_QOS)
+        self.create_subscription(
+            Frame, OUT_C_TOPIC, self.on_final_frame, FRAME_QOS)
+        self.create_subscription(
+            Metadata, METADATA_A_TOPIC, self.on_metadata, FRAME_QOS)
 
         # Per frame_id: holds whichever of {'image', 'meta'} has arrived so
         # far. A frame is only burned-in and streamed once both are present,
         # since arrival order between the metadata branch (A) and the image
         # chain (B->C) isn't guaranteed.
         self.pending = {}
-        self.sent_at = {}  # frame_id -> Time, for expiring stale pending entries
+        self.sent_at = {}  # frame_id -> Time, for garbage-collecting stale pending entries
+        self.sent_frame_ids = set()
         self.image_results = {}
         self.metadata_results = {}
+        # resolved (completed or given-up-on) among sent frames
         self.emitted_count = 0
-        self.total_frames = None  # known only once EOF is reached
+        self.total_sent = 0
+        self.dropped_count = 0  # frames skipped at the source due to backlog
+        self.total_frames = None  # == total_sent, known only once EOF is reached
         self.timeout_timer = None
         self.send_timer = None
         self._next_frame_index = 0
+        # Runs independently of send_timer (which stops at EOF) so trailing
+        # frames near the end of the video still get garbage-collected and
+        # _maybe_finish can trigger promptly instead of always waiting out
+        # the full COLLECT_TIMEOUT_S fallback.
+        self.gc_timer = self.create_timer(
+            PENDING_FRAME_TIMEOUT_S / 2, self._expire_stale_pending)
 
         self.get_logger().info(
             f'manager starting, mode={self.mode}, video={self.video_path} '
@@ -168,9 +189,8 @@ class ManagerNode(Node):
         # Wait for postprocessA/B to actually subscribe before sending
         # anything, rather than guessing a fixed delay: a frame published
         # before subscribers exist is silently dropped (default QoS is
-        # VOLATILE), and with the in-flight cap below, even ONE dropped
-        # frame near the start would stall the whole pipeline forever
-        # waiting for it to "complete".
+        # VOLATILE), which would just show up as one more dropped frame --
+        # harmless on its own, but no reason to waste it right at startup.
         self._discovery_start = self.get_clock().now()
         self.discovery_timer = self.create_timer(
             DISCOVERY_POLL_INTERVAL_S, self._on_discovery_check)
@@ -197,7 +217,8 @@ class ManagerNode(Node):
 
     def _on_discovery_check(self):
         matched = self.frame_pub.get_subscription_count()
-        waited_s = (self.get_clock().now() - self._discovery_start).nanoseconds / 1e9
+        waited_s = (self.get_clock().now() -
+                    self._discovery_start).nanoseconds / 1e9
         if matched < NEW_FRAME_SUBSCRIBERS_EXPECTED and waited_s < DISCOVERY_MAX_WAIT_S:
             return  # keep polling
         self.discovery_timer.cancel()
@@ -207,32 +228,49 @@ class ManagerNode(Node):
                 f'({matched}/{NEW_FRAME_SUBSCRIBERS_EXPECTED} after {waited_s:.1f}s); '
                 f'starting anyway')
         else:
-            self.get_logger().info(f'new_frame subscribers ready after {waited_s:.1f}s')
+            self.get_logger().info(
+                f'new_frame subscribers ready after {waited_s:.1f}s')
 
         control_msg = Control(
             mode=self.mode, command=Control.RUN, total_frames=self._estimated_frame_count)
         self.control_pub.publish(control_msg)
         # One frame per timer tick (not a sleep loop) so return callbacks for
         # early frames are never stuck behind later sends.
-        self.send_timer = self.create_timer(self.send_interval_s, self._on_send_timer)
+        self.send_timer = self.create_timer(
+            self.send_interval_s, self._on_send_timer)
 
     def _on_send_timer(self):
-        self._expire_stale_pending()
-        in_flight = self._next_frame_index - self.emitted_count
-        if in_flight >= MAX_IN_FLIGHT_FRAMES:
-            return  # postprocess chain hasn't caught up yet; wait for the next tick
-
+        # Always advance through the video on schedule, whether or not this
+        # particular frame ends up published -- that's what keeps content
+        # locked to real elapsed time instead of pausing when we're behind.
         ret, img = self.cap.read()
         if not ret:
             self.send_timer.cancel()
             self.cap.release()
-            self.total_frames = self._next_frame_index
-            self.get_logger().info(f'end of video reached, sent {self.total_frames} frame(s)')
-            self.timeout_timer = self.create_timer(self.timeout_s, self._on_timeout)
+            self.total_frames = self.total_sent
+            self.get_logger().info(
+                f'end of video reached, sent {self.total_sent} frame(s), '
+                f'dropped {self.dropped_count} for backlog')
+            self.timeout_timer = self.create_timer(
+                self.timeout_s, self._on_timeout)
             self._maybe_finish()
             return
 
         frame_id = self._next_frame_index
+        self._next_frame_index += 1
+
+        if len(self.pending) >= MAX_PENDING_BACKLOG:
+            # Downstream hasn't caught up on the frames already sent; skip
+            # this one outright rather than queueing it for later -- a live
+            # feed should show something close to "now", not something
+            # increasingly old.
+            self.dropped_count += 1
+            if frame_id % LOG_EVERY_N_FRAMES == 0:
+                self.get_logger().info(
+                    f'dropped frame_id={frame_id} (backlog full, '
+                    f'{self.dropped_count} dropped so far)')
+            return
+
         stamp = self.get_clock().now().to_msg()
         frame_msg = Frame(
             frame_id=frame_id, stamped_by=[], mode=self.mode,
@@ -240,21 +278,27 @@ class ManagerNode(Node):
         frame_msg.image = image_to_msg(img)
         self.frame_pub.publish(frame_msg)
         self.sent_at[frame_id] = self.get_clock().now()
+        self.sent_frame_ids.add(frame_id)
+        self.total_sent += 1
         if frame_id % LOG_EVERY_N_FRAMES == 0:
-            self.get_logger().info(f'sent frame_id={frame_id} mode={self.mode}')
-
-        self._next_frame_index += 1
+            self.get_logger().info(
+                f'sent frame_id={frame_id} mode={self.mode}')
 
     def _expire_stale_pending(self):
         now = self.get_clock().now()
+        expired_any = False
         for frame_id, sent_time in list(self.sent_at.items()):
             if frame_id in self.pending and (now - sent_time).nanoseconds / 1e9 > PENDING_FRAME_TIMEOUT_S:
-                self.get_logger().warning(
-                    f'frame_id={frame_id} incomplete after {PENDING_FRAME_TIMEOUT_S}s '
-                    f'(likely dropped under best-effort QoS); giving up on it')
+                if frame_id % LOG_EVERY_N_FRAMES == 0:
+                    self.get_logger().info(
+                        f'frame_id={frame_id} never completed (lost in transit under '
+                        f'best-effort QoS); dropping it from the backlog count')
                 del self.pending[frame_id]
                 del self.sent_at[frame_id]
                 self.emitted_count += 1
+                expired_any = True
+        if expired_any:
+            self._maybe_finish()
 
     def on_final_frame(self, msg):
         entry = self.pending.setdefault(msg.frame_id, {})
@@ -302,7 +346,8 @@ class ManagerNode(Node):
         if entry is None or 'image' not in entry or 'meta' not in entry:
             return
 
-        img = burn_metadata_on_frame(entry['image'], frame_id, entry['meta']['mean_brightness'])
+        img = burn_metadata_on_frame(
+            entry['image'], frame_id, entry['meta']['mean_brightness'])
         self._gst_queue.put(img)
 
         self.image_results[frame_id] = entry['image_stats']
@@ -331,13 +376,19 @@ class ManagerNode(Node):
                 f"{r['ring_total_ms']:>13.1f} | {'PASS' if r['ok'] else 'FAIL':>6} | "
                 f"{m.get('transport_ms', float('nan')):>17.1f} | "
                 f"{m.get('mean_brightness', float('nan')):>15.1f}")
-        avg_transport = sum(r['transport_ms'] for r in self.image_results.values()) / len(self.image_results)
-        avg_total = sum(r['ring_total_ms'] for r in self.image_results.values()) / len(self.image_results)
+        avg_transport = sum(r['transport_ms']
+                            for r in self.image_results.values()) / len(self.image_results)
+        avg_total = sum(r['ring_total_ms']
+                        for r in self.image_results.values()) / len(self.image_results)
         self.get_logger().info(
             f'average image transport_ms={avg_transport:.1f} '
             f'average ring_total_ms={avg_total:.1f}')
+        self.get_logger().info(
+            f'sent={self.total_sent} dropped_for_backlog={self.dropped_count} '
+            f'completed={len(self.image_results)}')
 
-        stop_msg = Control(mode=self.mode, command=Control.STOP, total_frames=self.total_frames)
+        stop_msg = Control(mode=self.mode, command=Control.STOP,
+                           total_frames=self.total_frames)
         self.control_pub.publish(stop_msg)
 
         self.stop_gst()
@@ -374,9 +425,10 @@ class ManagerNode(Node):
 
     def _on_timeout(self):
         self.timeout_timer.cancel()
-        missing = sorted(set(range(self.total_frames)) - set(self.image_results))
+        missing = sorted(self.sent_frame_ids - set(self.image_results))
         if missing:
-            self.get_logger().warning(f'timed out; missing frame_id(s)={missing}')
+            self.get_logger().warning(
+                f'timed out; missing frame_id(s)={missing}')
 
 
 def main(args=None):

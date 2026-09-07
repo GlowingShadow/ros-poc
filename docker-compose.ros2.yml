@@ -17,9 +17,11 @@ x-ros2-app: &ros2-app
     RMW_IMPLEMENTATION: rmw_fastrtps_cpp
     # Real video frame rate makes the postprocessB->postprocessC hop-delay
     # simulation (meant for the static 5-image demo) fall further behind
-    # every frame; keep it near-zero so the live stream stays real-time.
+    # every frame; zeroed out so the live stream stays real-time. No longer
+    # simulating "real work" per hop, since this is now a live-feed
+    # pipeline rather than the original transport-cost demo.
     MIN_PROCESSING_DELAY_S: ${MIN_PROCESSING_DELAY_S:-0.0}
-    MAX_PROCESSING_DELAY_S: ${MAX_PROCESSING_DELAY_S:-0.02}
+    MAX_PROCESSING_DELAY_S: ${MAX_PROCESSING_DELAY_S:-0.0}
     # Only read by manager; harmless no-ops for postprocessA/B/C.
     VIDEO_PATH: ${VIDEO_PATH:-/workspace/input/video_720.mp4}
     GST_UDP_HOST: ${GST_UDP_HOST:-host.docker.internal}
