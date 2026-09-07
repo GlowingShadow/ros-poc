@@ -19,6 +19,7 @@ import os
 import queue
 import subprocess
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -104,8 +105,14 @@ def image_to_msg(img):
 
 
 def msg_to_image(msg):
-    arr = np.frombuffer(bytes(msg.image_data), dtype=np.uint8)
-    return arr.reshape(FRAME_HEIGHT, FRAME_WIDTH, 3).copy()
+    # msg.image_data is already a numpy uint8 array (rosidl generates numpy
+    # storage for fixed-size numeric arrays -- see image_to_msg). reshape is a
+    # view; the single .copy() gives cv2.putText a writable buffer that stays
+    # valid after `msg` is GC'd. The old bytes(msg.image_data) was a second
+    # full 2.7MB copy for nothing; np.asarray keeps this a no-op for numpy
+    # input while still handling array.array from other rmw impls.
+    return np.asarray(msg.image_data, dtype=np.uint8).reshape(
+        FRAME_HEIGHT, FRAME_WIDTH, 3).copy()
 
 
 def burn_metadata_on_frame(img, frame_id, mean_brightness):
@@ -165,6 +172,21 @@ class ManagerNode(Node):
             target=self._gst_worker_loop, daemon=True)
         self._gst_worker_thread.start()
 
+        # cap.read() (H.264 decode) is too heavy to run on the executor thread
+        # -- it competes with the receive callbacks for the single spin()
+        # thread. A paced background thread owns `cap` and decodes on the real-
+        # time schedule into a size-1 "latest frame" slot (overwrite = drop
+        # stale); the send timer just consumes whatever's freshest. Content
+        # stays locked to the wall clock because *decode* advances on schedule,
+        # and the executor never touches `cap`, so pipeline state stays
+        # lock-free on the executor thread as before.
+        self._latest_lock = threading.Lock()
+        self._latest_frame = None      # (frame_id, img): freshest undelivered decode
+        self._decode_eof = False
+        self._decode_stop = threading.Event()
+        self._decode_thread = None
+        self._decode_index = 0
+
         self.control_pub = self.create_publisher(
             Control, CONTROL_TOPIC, CONTROL_QOS)
         self.frame_pub = self.create_publisher(
@@ -190,7 +212,6 @@ class ManagerNode(Node):
         self.total_frames = None  # == total_sent, known only once EOF is reached
         self.timeout_timer = None
         self.send_timer = None
-        self._next_frame_index = 0
         # Runs independently of send_timer (which stops at EOF) so trailing
         # frames near the end of the video still get garbage-collected and
         # _maybe_finish can trigger promptly instead of always waiting out
@@ -251,30 +272,63 @@ class ManagerNode(Node):
         control_msg = Control(
             mode=self.mode, command=Control.RUN, total_frames=self._estimated_frame_count)
         self.control_pub.publish(control_msg)
+        # Start decode and sending together -- decoding is gated until now so
+        # the video isn't burned through during the discovery wait.
+        self._decode_thread = threading.Thread(
+            target=self._decode_loop, daemon=True)
+        self._decode_thread.start()
         # One frame per timer tick (not a sleep loop) so return callbacks for
         # early frames are never stuck behind later sends.
         self.send_timer = self.create_timer(
             self.send_interval_s, self._on_send_timer)
 
-    def _on_send_timer(self):
-        # Always advance through the video on schedule, whether or not this
-        # particular frame ends up published -- that's what keeps content
-        # locked to real elapsed time instead of pausing when we're behind.
-        ret, img = self.cap.read()
-        if not ret:
-            self.send_timer.cancel()
-            self.cap.release()
-            self.total_frames = self.total_sent
-            self.get_logger().info(
-                f'end of video reached, sent {self.total_sent} frame(s), '
-                f'dropped {self.dropped_count} for backlog')
-            self.timeout_timer = self.create_timer(
-                self.timeout_s, self._on_timeout)
-            self._maybe_finish()
-            return
+    def _decode_loop(self):
+        # Owns `cap`. Decodes on a fixed real-time schedule into the size-1
+        # slot; overwriting drops frames the send timer didn't grab (live feed
+        # shows the newest, not a backlog). Clamps the deadline when behind so
+        # a slow decode can't spiral into an ever-growing deficit.
+        next_deadline = time.monotonic()
+        while not self._decode_stop.is_set():
+            ret, img = self.cap.read()
+            if not ret:
+                with self._latest_lock:
+                    self._decode_eof = True
+                return
+            frame_id = self._decode_index
+            self._decode_index += 1
+            with self._latest_lock:
+                self._latest_frame = (frame_id, img)
+            next_deadline += self.send_interval_s
+            delay = next_deadline - time.monotonic()
+            if delay > 0:
+                self._decode_stop.wait(delay)   # interruptible sleep
+            else:
+                next_deadline = time.monotonic()  # behind: drop the deficit
 
-        frame_id = self._next_frame_index
-        self._next_frame_index += 1
+    def _on_send_timer(self):
+        # Pure consumer: grab the freshest decoded frame (if any) and publish
+        # it. Decoding + real-time pacing live on _decode_loop; content stays
+        # locked to the wall clock there, so falling behind here just means
+        # skipping ahead in content, never slowing down to catch up.
+        with self._latest_lock:
+            item = self._latest_frame
+            self._latest_frame = None       # consume, so we never resend it
+            eof = self._decode_eof
+
+        if item is None:
+            if eof:                          # decode finished and slot drained
+                self.send_timer.cancel()
+                self.cap.release()
+                self.total_frames = self.total_sent
+                self.get_logger().info(
+                    f'end of video reached, sent {self.total_sent} frame(s), '
+                    f'dropped {self.dropped_count} for backlog')
+                self.timeout_timer = self.create_timer(
+                    self.timeout_s, self._on_timeout)
+                self._maybe_finish()
+            return                           # no fresh frame this tick
+
+        frame_id, img = item
 
         if len(self.pending) >= MAX_PENDING_BACKLOG:
             # Downstream hasn't caught up on the frames already sent; skip
@@ -408,10 +462,17 @@ class ManagerNode(Node):
                            total_frames=self.total_frames)
         self.control_pub.publish(stop_msg)
 
+        self.stop_decode()
         self.stop_gst()
         self.get_logger().info('manager finished all frames, shutting down')
         if rclpy.ok():
             rclpy.shutdown()
+
+    def stop_decode(self):
+        self._decode_stop.set()
+        if self._decode_thread is not None:
+            self._decode_thread.join(timeout=2.0)
+            self._decode_thread = None
 
     def _gst_worker_loop(self):
         # Keep draining even after stop is requested, so frames already
@@ -457,6 +518,7 @@ def main(args=None):
         pass
     finally:
         try:
+            node.stop_decode()
             node.stop_gst()
             node.cap.release()
             node.destroy_node()

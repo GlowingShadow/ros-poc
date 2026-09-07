@@ -30,7 +30,7 @@ x-ros2-app: &ros2-app
     # topic it publishes to) -- set to 0 to bypass postprocessC, with B
     # publishing straight to out_c. Keep these two readers in sync; that's
     # the whole point of sharing one env var instead of two.
-    ENABLE_POSTPROCESS_C: ${ENABLE_POSTPROCESS_C:-1}
+    ENABLE_POSTPROCESS_C: ${ENABLE_POSTPROCESS_C:-0}
   volumes:
     - .:/workspace:cached
   restart: "no"
@@ -40,15 +40,23 @@ services:
     <<: *ros2-app
     ipc: shareable
     command: ["ros2", "run", "manager", "manager_node"]
-    # Lets manager reach a gst-launch-1.0 receiver run directly in the
-    # devcontainer shell: that shell is the Docker host for the nested
-    # dockerd running this stack, i.e. this container's host-gateway.
-    # Pinned to the literal IPv4 gateway (see the ros2net ipam config below)
-    # rather than the "host-gateway" magic string: on this nested dockerd
-    # that string resolves to an IPv6 address with no route on this
-    # network, silently black-holing every packet.
+    # Lets manager reach a gst-launch-1.0 receiver on whatever counts as
+    # "the Docker host" for this stack.
+    #
+    # Running directly on Docker Desktop (no nesting): leave
+    # HOST_DOCKER_INTERNAL_IP unset. The "host-gateway" magic string is
+    # Compose's normal mechanism and Docker Desktop resolves it straight to
+    # the real Windows/macOS host.
+    #
+    # Running nested inside the ros-poc devcontainer (docker-in-docker): the
+    # "host-gateway" magic string resolves to an IPv6 address with no route
+    # on that nested dockerd, silently black-holing every packet. Override
+    # with the literal ros2net gateway instead, e.g.:
+    #   HOST_DOCKER_INTERNAL_IP=10.201.0.1 ./scripts/run.sh
+    # which lands the stream in the devcontainer shell's own netns (see the
+    # ros2net ipam config below) for scripts/relay-stream.sh to forward on.
     extra_hosts:
-      - "host.docker.internal:172.28.0.1"
+      - "host.docker.internal:${HOST_DOCKER_INTERNAL_IP:-host-gateway}"
     healthcheck:
       # All four services share the bind-mounted /workspace, and only
       # manager runs colcon build. postprocessA/B/C must wait for this
@@ -89,5 +97,5 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.28.0.0/16
-          gateway: 172.28.0.1
+        - subnet: 10.201.0.0/24
+          gateway: 10.201.0.1
