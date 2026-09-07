@@ -35,11 +35,11 @@ RUN apt-get install -y --no-install-recommends \
         telnet \
         net-tools
 
-# GStreamer receiver for the ros2-app manager's live video stream (UDP:5000)
 RUN apt-get install -y --no-install-recommends \
         gstreamer1.0-tools \
         gstreamer1.0-plugins-base \
-        gstreamer1.0-plugins-good
+        gstreamer1.0-plugins-good \
+        ffmpeg
 
 RUN apt-get clean && rm -rf /var/lib/apt/lists/*
 
