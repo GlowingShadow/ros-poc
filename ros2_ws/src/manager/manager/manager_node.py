@@ -60,7 +60,17 @@ DISCOVERY_MAX_WAIT_S = 30.0
 # means skipping ahead in content, never slowing down to catch up.
 # MAX_PENDING_BACKLOG bounds how many *sent* frames may be unresolved at
 # once before new frames stop being published at all (silently skipped,
-# not queued for later).
+# not queued for later). This is a binary gate (full/not-full), and B/C's
+# completions naturally arrive in clusters (each is a single serial
+# worker-thread queue), so admission driven purely by "is there room right
+# now" mirrors that clustering: a burst of sends followed by a burst of
+# drops, repeating -- clumpy output that reads as stutter even though
+# nothing ever pauses. ADMIT_EVERY_N_FRAMES fixes that by deciding
+# admission on a fixed schedule instead (every Nth captured frame,
+# regardless of backlog state), producing a steady, evenly-spaced
+# reduced frame rate instead of bursts. MAX_PENDING_BACKLOG remains as a
+# safety net beneath that in case the pacing rate still outstrips B->C's
+# real throughput.
 MAX_PENDING_BACKLOG = 6
 # Pure garbage collection now, not a latency-critical unblock: a frame
 # that's lost for good (BEST_EFFORT QoS permits this) would otherwise sit
@@ -128,6 +138,7 @@ class ManagerNode(Node):
             'GST_UDP_HOST', 'host.docker.internal')
         self.gst_udp_port = int(os.environ.get('GST_UDP_PORT', '5000'))
         self.timeout_s = float(os.environ.get('COLLECT_TIMEOUT_S', '30.0'))
+        self.admit_every_n = int(os.environ.get('ADMIT_EVERY_N_FRAMES', '2'))
 
         self.cap = cv2.VideoCapture(self.video_path)
         if not self.cap.isOpened():
@@ -263,6 +274,18 @@ class ManagerNode(Node):
 
         frame_id = self._next_frame_index
         self._next_frame_index += 1
+
+        if frame_id % self.admit_every_n != 0:
+            # Fixed-schedule pacing (see ADMIT_EVERY_N_FRAMES above): drop
+            # on a steady beat rather than reacting to backlog state, so
+            # output is evenly spaced instead of clumped into send/drop
+            # bursts.
+            self.dropped_count += 1
+            if frame_id % LOG_EVERY_N_FRAMES == 0:
+                self.get_logger().info(
+                    f'dropped frame_id={frame_id} (paced, '
+                    f'{self.dropped_count} dropped so far)')
+            return
 
         if len(self.pending) >= MAX_PENDING_BACKLOG:
             # Downstream hasn't caught up on the frames already sent; skip
