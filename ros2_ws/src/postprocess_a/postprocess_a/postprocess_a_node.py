@@ -27,6 +27,10 @@ IN_TOPIC = 'new_frame'
 OUT_TOPIC = 'metadata_a'
 CONTROL_TOPIC = 'control'
 WORKER_POLL_TIMEOUT_S = 0.5
+# Video source is a fixed 1280x720 BGR8 -- these are now schema-level facts
+# (Frame.image_data is a fixed-size array), not read from the message.
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 720
 
 CONTROL_QOS = QoSProfile(
     depth=1,
@@ -48,8 +52,8 @@ FRAME_QOS = QoSProfile(
 
 
 def msg_to_image(msg):
-    arr = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-    return arr.reshape(msg.height, msg.width, 3).copy()
+    arr = np.frombuffer(bytes(msg.image_data), dtype=np.uint8)
+    return arr.reshape(FRAME_HEIGHT, FRAME_WIDTH, 3).copy()
 
 
 def random_processing_delay(min_s, max_s):
@@ -100,7 +104,7 @@ class PostprocessANode(Node):
             self._process_frame(msg, t_recv)
 
     def _process_frame(self, msg, t_recv):
-        img = msg_to_image(msg.image)
+        img = msg_to_image(msg)
 
         delay = random_processing_delay(self.min_delay_s, self.max_delay_s)
         time.sleep(delay)
@@ -111,8 +115,8 @@ class PostprocessANode(Node):
         out_msg = Metadata(
             frame_id=msg.frame_id,
             mode=msg.mode,
-            width=msg.image.width,
-            height=msg.image.height,
+            width=FRAME_WIDTH,
+            height=FRAME_HEIGHT,
             mean_brightness=mean_brightness,
             origin_stamp=msg.origin_stamp,
             hop_stamp=self.get_clock().now().to_msg(),

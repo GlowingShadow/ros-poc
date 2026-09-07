@@ -22,7 +22,6 @@ from pipeline_interfaces.msg import Control, Frame
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.time import Time
-from sensor_msgs.msg import Image
 
 ROLE = 'postprocessC'
 IN_TOPIC = 'out_b'
@@ -30,6 +29,11 @@ OUT_TOPIC = 'out_c'
 CONTROL_TOPIC = 'control'
 STAMP_SLOT = 1
 WORKER_POLL_TIMEOUT_S = 0.5
+# Video source is a fixed 1280x720 BGR8 -- these are now schema-level facts
+# (Frame.image_data is a fixed-size array), not read from the message.
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 720
+FRAME_DATA_LEN = FRAME_WIDTH * FRAME_HEIGHT * 3
 
 CONTROL_QOS = QoSProfile(
     depth=1,
@@ -51,19 +55,17 @@ FRAME_QOS = QoSProfile(
 
 
 def msg_to_image(msg):
-    arr = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-    return arr.reshape(msg.height, msg.width, 3).copy()
+    arr = np.frombuffer(bytes(msg.image_data), dtype=np.uint8)
+    return arr.reshape(FRAME_HEIGHT, FRAME_WIDTH, 3).copy()
 
 
 def image_to_msg(img):
-    msg = Image()
-    msg.height = img.shape[0]
-    msg.width = img.shape[1]
-    msg.encoding = 'bgr8'
-    msg.is_bigendian = 0
-    msg.step = msg.width * 3
-    msg.data = img.tobytes()
-    return msg
+    # Frame.image_data is a fixed-size array (uint8[2764800]) -- unlike the
+    # old dynamic uint8[] field, its generated setter does
+    # numpy.array(value, dtype=uint8), which does NOT treat `bytes` as a
+    # buffer of ints (raises ValueError). np.frombuffer is required here.
+    assert img.nbytes == FRAME_DATA_LEN, f'expected {FRAME_DATA_LEN} bytes, got {img.nbytes}'
+    return np.frombuffer(img.tobytes(), dtype=np.uint8)
 
 
 def stamp_name_on_frame(img, name, slot_index):
@@ -120,7 +122,7 @@ class PostprocessCNode(Node):
             self._process_frame(msg, t_recv)
 
     def _process_frame(self, msg, t_recv):
-        img = msg_to_image(msg.image)
+        img = msg_to_image(msg)
 
         delay = random_processing_delay(self.min_delay_s, self.max_delay_s)
         time.sleep(delay)
@@ -129,12 +131,12 @@ class PostprocessCNode(Node):
 
         out_msg = Frame(
             frame_id=msg.frame_id,
-            stamped_by=list(msg.stamped_by) + [ROLE],
+            stamped_by_count=msg.stamped_by_count + 1,
             mode=msg.mode,
             origin_stamp=msg.origin_stamp,
             hop_stamp=self.get_clock().now().to_msg(),
         )
-        out_msg.image = image_to_msg(img)
+        out_msg.image_data = image_to_msg(img)
         self.publisher.publish(out_msg)
         t_pub = self.get_clock().now()
 
