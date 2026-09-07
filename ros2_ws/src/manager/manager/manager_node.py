@@ -24,14 +24,21 @@ from pipeline_interfaces.msg import Control, Frame, Metadata
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.time import Time
-from sensor_msgs.msg import Image
 
 CONTROL_TOPIC = 'control'
 NEW_FRAME_TOPIC = 'new_frame'
 OUT_C_TOPIC = 'out_c'
 METADATA_A_TOPIC = 'metadata_a'
-# The image now only passes through B and C (A produces metadata, not a stamp).
-EXPECTED_STAMP_ORDER = ['postprocessB', 'postprocessC']
+# Video source is a fixed 1280x720 BGR8 -- these are now schema-level facts
+# (Frame.image_data is a fixed-size array), not read from the message.
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 720
+FRAME_DATA_LEN = FRAME_WIDTH * FRAME_HEIGHT * 3
+# The image now only passes through B and C (A produces metadata, not a stamp);
+# reaching manager via out_c with stamped_by_count == 2 already proves both hops
+# ran, in order (out_c is only ever reachable through out_b).
+EXPECTED_STAMP_COUNT = 2
+MODE_TO_INT = {'copy': Frame.MODE_COPY, 'zero_copy': Frame.MODE_ZERO_COPY}
 DEFAULT_FPS = 30.0
 WORKER_POLL_TIMEOUT_S = 0.5
 # Logging every frame was fine for the original 5-image demo but at real
@@ -82,19 +89,17 @@ FRAME_QOS = QoSProfile(
 
 
 def image_to_msg(img):
-    msg = Image()
-    msg.height = img.shape[0]
-    msg.width = img.shape[1]
-    msg.encoding = 'bgr8'
-    msg.is_bigendian = 0
-    msg.step = msg.width * 3
-    msg.data = img.tobytes()
-    return msg
+    # Frame.image_data is a fixed-size array (uint8[2764800]) -- unlike the
+    # old dynamic uint8[] field, its generated setter does
+    # numpy.array(value, dtype=uint8), which does NOT treat `bytes` as a
+    # buffer of ints (raises ValueError). np.frombuffer is required here.
+    assert img.nbytes == FRAME_DATA_LEN, f'expected {FRAME_DATA_LEN} bytes, got {img.nbytes}'
+    return np.frombuffer(img.tobytes(), dtype=np.uint8)
 
 
 def msg_to_image(msg):
-    arr = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-    return arr.reshape(msg.height, msg.width, 3).copy()
+    arr = np.frombuffer(bytes(msg.image_data), dtype=np.uint8)
+    return arr.reshape(FRAME_HEIGHT, FRAME_WIDTH, 3).copy()
 
 
 def burn_metadata_on_frame(img, frame_id, mean_brightness):
@@ -273,9 +278,9 @@ class ManagerNode(Node):
 
         stamp = self.get_clock().now().to_msg()
         frame_msg = Frame(
-            frame_id=frame_id, stamped_by=[], mode=self.mode,
+            frame_id=frame_id, stamped_by_count=0, mode=MODE_TO_INT[self.mode],
             origin_stamp=stamp, hop_stamp=stamp)
-        frame_msg.image = image_to_msg(img)
+        frame_msg.image_data = image_to_msg(img)
         self.frame_pub.publish(frame_msg)
         self.sent_at[frame_id] = self.get_clock().now()
         self.sent_frame_ids.add(frame_id)
@@ -308,14 +313,14 @@ class ManagerNode(Node):
         t_recv = self.get_clock().now()
         transport_ms = elapsed_ms(t_recv, msg.hop_stamp)
         ring_total_ms = elapsed_ms(t_recv, msg.origin_stamp)
-        ok = list(msg.stamped_by) == EXPECTED_STAMP_ORDER
+        ok = msg.stamped_by_count == EXPECTED_STAMP_COUNT
         if msg.frame_id % LOG_EVERY_N_FRAMES == 0:
             self.get_logger().info(
                 f'[manager] image frame_id={msg.frame_id} mode={msg.mode} '
                 f'transport_ms={transport_ms:.1f} ring_total_ms={ring_total_ms:.1f} '
-                f"{'PASS' if ok else 'FAIL'} stamped_by={list(msg.stamped_by)}")
+                f"{'PASS' if ok else 'FAIL'} stamped_by_count={msg.stamped_by_count}")
 
-        entry['image'] = msg_to_image(msg.image)
+        entry['image'] = msg_to_image(msg)
         entry['image_stats'] = {
             'transport_ms': transport_ms, 'ring_total_ms': ring_total_ms, 'ok': ok,
         }
