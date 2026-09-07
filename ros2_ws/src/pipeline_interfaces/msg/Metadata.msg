@@ -1,5 +1,8 @@
+uint8 MODE_COPY=0
+uint8 MODE_ZERO_COPY=1
+
 uint32 frame_id
-string mode
+uint8 mode
 uint32 width
 uint32 height
 float64 mean_brightness
