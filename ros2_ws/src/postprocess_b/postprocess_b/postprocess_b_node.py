@@ -1,6 +1,7 @@
 """postprocessB: receives frames on new_frame, sleeps for an
 arbitrary duration (fake processing), stamps 'postprocessB' onto the frame,
-and forwards it to out_b. Fully self-contained: no shared code
+and forwards it to out_b (or straight to out_c, bypassing postprocessC, if
+ENABLE_POSTPROCESS_C=0). Fully self-contained: no shared code
 with manager/postprocess_a/postprocess_c beyond the pipeline_interfaces
 message definitions.
 
@@ -25,7 +26,11 @@ from rclpy.time import Time
 
 ROLE = 'postprocessB'
 IN_TOPIC = 'new_frame'
-OUT_TOPIC = 'out_b'
+# When disabled, publish straight to out_c (manager's subscription topic)
+# instead of out_b, bypassing postprocessC entirely. manager reads the same
+# env var to keep EXPECTED_STAMP_COUNT in sync -- see manager_node.py.
+ENABLE_POSTPROCESS_C = os.environ.get('ENABLE_POSTPROCESS_C', '1') != '0'
+OUT_TOPIC = 'out_b' if ENABLE_POSTPROCESS_C else 'out_c'
 CONTROL_TOPIC = 'control'
 STAMP_SLOT = 0
 WORKER_POLL_TIMEOUT_S = 0.5

@@ -4,6 +4,9 @@ on new_frame, which fans out to two branches:
     manager --new_frame--> postprocessA --metadata_a--> manager   (metadata branch)
     manager --new_frame--> postprocessB --out_b--> postprocessC --out_c--> manager  (image chain)
 
+Set ENABLE_POSTPROCESS_C=0 (read by both this node and postprocessB) to
+bypass postprocessC: postprocessB then publishes straight to out_c.
+
 For each frame_id, once BOTH the final stamped image (out_c) and the
 metadata (metadata_a) have arrived, the manager burns frame_id and
 mean_brightness onto the frame and streams it live over UDP via a
@@ -34,10 +37,13 @@ METADATA_A_TOPIC = 'metadata_a'
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 FRAME_DATA_LEN = FRAME_WIDTH * FRAME_HEIGHT * 3
-# The image now only passes through B and C (A produces metadata, not a stamp);
-# reaching manager via out_c with stamped_by_count == 2 already proves both hops
-# ran, in order (out_c is only ever reachable through out_b).
-EXPECTED_STAMP_COUNT = 2
+# Must track postprocessB's own ENABLE_POSTPROCESS_C (see
+# postprocess_b_node.py): when postprocessC is bypassed, B publishes
+# straight to out_c and only one hop stamps the frame before manager sees
+# it, instead of two. Reading the same env var here keeps the two in sync
+# instead of requiring this to be hand-edited alongside postprocessB's.
+ENABLE_POSTPROCESS_C = os.environ.get('ENABLE_POSTPROCESS_C', '1') != '0'
+EXPECTED_STAMP_COUNT = 2 if ENABLE_POSTPROCESS_C else 1
 MODE_TO_INT = {'copy': Frame.MODE_COPY, 'zero_copy': Frame.MODE_ZERO_COPY}
 DEFAULT_FPS = 30.0
 WORKER_POLL_TIMEOUT_S = 0.5
@@ -60,17 +66,7 @@ DISCOVERY_MAX_WAIT_S = 30.0
 # means skipping ahead in content, never slowing down to catch up.
 # MAX_PENDING_BACKLOG bounds how many *sent* frames may be unresolved at
 # once before new frames stop being published at all (silently skipped,
-# not queued for later). This is a binary gate (full/not-full), and B/C's
-# completions naturally arrive in clusters (each is a single serial
-# worker-thread queue), so admission driven purely by "is there room right
-# now" mirrors that clustering: a burst of sends followed by a burst of
-# drops, repeating -- clumpy output that reads as stutter even though
-# nothing ever pauses. ADMIT_EVERY_N_FRAMES fixes that by deciding
-# admission on a fixed schedule instead (every Nth captured frame,
-# regardless of backlog state), producing a steady, evenly-spaced
-# reduced frame rate instead of bursts. MAX_PENDING_BACKLOG remains as a
-# safety net beneath that in case the pacing rate still outstrips B->C's
-# real throughput.
+# not queued for later).
 MAX_PENDING_BACKLOG = 6
 # Pure garbage collection now, not a latency-critical unblock: a frame
 # that's lost for good (BEST_EFFORT QoS permits this) would otherwise sit
@@ -138,7 +134,6 @@ class ManagerNode(Node):
             'GST_UDP_HOST', 'host.docker.internal')
         self.gst_udp_port = int(os.environ.get('GST_UDP_PORT', '5000'))
         self.timeout_s = float(os.environ.get('COLLECT_TIMEOUT_S', '30.0'))
-        self.admit_every_n = int(os.environ.get('ADMIT_EVERY_N_FRAMES', '2'))
 
         self.cap = cv2.VideoCapture(self.video_path)
         if not self.cap.isOpened():
@@ -274,18 +269,6 @@ class ManagerNode(Node):
 
         frame_id = self._next_frame_index
         self._next_frame_index += 1
-
-        if frame_id % self.admit_every_n != 0:
-            # Fixed-schedule pacing (see ADMIT_EVERY_N_FRAMES above): drop
-            # on a steady beat rather than reacting to backlog state, so
-            # output is evenly spaced instead of clumped into send/drop
-            # bursts.
-            self.dropped_count += 1
-            if frame_id % LOG_EVERY_N_FRAMES == 0:
-                self.get_logger().info(
-                    f'dropped frame_id={frame_id} (paced, '
-                    f'{self.dropped_count} dropped so far)')
-            return
 
         if len(self.pending) >= MAX_PENDING_BACKLOG:
             # Downstream hasn't caught up on the frames already sent; skip

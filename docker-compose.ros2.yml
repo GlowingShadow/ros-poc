@@ -23,9 +23,14 @@ x-ros2-app: &ros2-app
     MIN_PROCESSING_DELAY_S: ${MIN_PROCESSING_DELAY_S:-0.0}
     MAX_PROCESSING_DELAY_S: ${MAX_PROCESSING_DELAY_S:-0.0}
     # Only read by manager; harmless no-ops for postprocessA/B/C.
-    VIDEO_PATH: ${VIDEO_PATH:-/workspace/input/video_720.mp4}
+    VIDEO_PATH: ${VIDEO_PATH:-/workspace/input/video_720p_30fps.mp4}
     GST_UDP_HOST: ${GST_UDP_HOST:-host.docker.internal}
     GST_UDP_PORT: ${GST_UDP_PORT:-5000}
+    # Read by both manager (EXPECTED_STAMP_COUNT) and postprocessB (which
+    # topic it publishes to) -- set to 0 to bypass postprocessC, with B
+    # publishing straight to out_c. Keep these two readers in sync; that's
+    # the whole point of sharing one env var instead of two.
+    ENABLE_POSTPROCESS_C: ${ENABLE_POSTPROCESS_C:-1}
   volumes:
     - .:/workspace:cached
   restart: "no"
