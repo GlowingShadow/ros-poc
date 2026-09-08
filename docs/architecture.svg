@@ -117,42 +117,47 @@
   <rect x="110" y="800" width="1480" height="290" rx="10" fill="#ffffff" stroke="#1a1a2e" stroke-width="2"/>
   <rect x="110" y="800" width="1480" height="50" rx="10" fill="#1a1a2e"/>
   <text x="850" y="825" text-anchor="middle" font-size="18" font-weight="bold" fill="#fff">manager — generator + collector + live streamer</text>
-  <text x="850" y="843" text-anchor="middle" font-size="12" fill="#c9c9e0">MAIN THREAD (rclpy.spin) + 1 background worker thread (gst-launch writer)</text>
+  <text x="850" y="843" text-anchor="middle" font-size="12" fill="#c9c9e0">MAIN THREAD (rclpy.spin, manager_node.py) + 2 background threads: video_source.py (decode) · gst_sink.py (stream writer)</text>
 
   <rect x="122" y="858" width="1456" height="220" rx="7" fill="#e8f0fe" stroke="#4285f4"/>
   <line x1="620" y1="866" x2="620" y2="1070" stroke="#b6cdfb"/>
   <line x1="1092" y1="866" x2="1092" y2="1070" stroke="#b6cdfb"/>
 
   <!-- manager col 1: source -->
-  <text x="140" y="884" font-size="12.5" font-weight="bold" fill="#1a56c4">OUTPUT (source)</text>
-  <text x="140" y="902" font-size="12.5" fill="#222" font-family="monospace">cv2.VideoCapture(VIDEO_PATH)</text>
-  <text x="140" y="920" font-size="12.5" fill="#222" font-family="monospace">wait for new_frame subscribers</text>
-  <text x="140" y="938" font-size="12.5" fill="#222" font-family="monospace">send_timer (every 1/fps):</text>
-  <text x="152" y="956" font-size="12.5" fill="#2e8b57" font-family="monospace">publish Frame → new_frame</text>
-  <text x="152" y="974" font-size="12.5" fill="#c0392b" font-family="monospace">skip if backlog full (never pause)</text>
-  <text x="140" y="996" font-size="12.5" fill="#7b3fbf" font-family="monospace">at startup: control_pub → RUN</text>
-  <text x="140" y="1014" font-size="11.5" fill="#888" font-style="italic">continuous stream, not one pass</text>
+  <text x="140" y="884" font-size="12.5" font-weight="bold" fill="#1a56c4">SOURCE</text>
+  <text x="140" y="900" font-size="11" font-weight="bold" fill="#b8531a">video_source.py — decode thread</text>
+  <text x="152" y="916" font-size="12.5" fill="#222" font-family="monospace">cv2.VideoCapture(VIDEO_PATH)</text>
+  <text x="152" y="934" font-size="12.5" fill="#222" font-family="monospace">real-time pace → latest-frame slot</text>
+  <text x="152" y="950" font-size="11.5" fill="#888" font-style="italic" font-family="monospace">(overwrite drops stale, never queues)</text>
+  <text x="140" y="970" font-size="11" font-weight="bold" fill="#1a56c4">manager_node.py — main thread</text>
+  <text x="152" y="986" font-size="12.5" fill="#222" font-family="monospace">send_timer (1/fps): take_latest()</text>
+  <text x="152" y="1002" font-size="12.5" fill="#2e8b57" font-family="monospace">publish Frame → new_frame</text>
+  <text x="152" y="1018" font-size="12.5" fill="#c0392b" font-family="monospace">skip if backlog full (never pause)</text>
+  <text x="140" y="1038" font-size="12.5" fill="#7b3fbf" font-family="monospace">at startup: control_pub → RUN</text>
+  <text x="140" y="1056" font-size="11.5" fill="#888" font-style="italic">continuous stream, not one pass</text>
 
   <!-- manager col 2: image collector -->
   <text x="640" y="884" font-size="12.5" font-weight="bold" fill="#1a56c4">IMAGE COLLECTOR</text>
-  <text x="640" y="904" font-size="12.5" fill="#222" font-family="monospace">on_final_frame() ← out_c</text>
-  <text x="652" y="922" font-size="12.5" fill="#222" font-family="monospace">verify stamped_by_count == 2</text>
-  <text x="652" y="940" font-size="12.5" fill="#222" font-family="monospace">(or 1 if C bypassed) → PASS/FAIL</text>
-  <text x="640" y="962" font-size="12.5" fill="#222" font-family="monospace">join w/ metadata_a per frame_id</text>
-  <text x="652" y="980" font-size="12.5" fill="#c2185b" font-family="monospace">→ burn frame_id + brightness</text>
-  <text x="652" y="998" font-size="12.5" fill="#c2185b" font-family="monospace">→ gst_queue.put() (stream out)</text>
-  <text x="640" y="1020" font-size="12.5" fill="#222" font-family="monospace">log transport_ms / ring_ms</text>
+  <text x="640" y="900" font-size="11" fill="#888" font-style="italic">manager_node.py · frame_sync.py · frame_codec.py</text>
+  <text x="640" y="918" font-size="12.5" fill="#222" font-family="monospace">on_final_frame() ← out_c</text>
+  <text x="652" y="936" font-size="12.5" fill="#222" font-family="monospace">verify stamped_by_count == 2</text>
+  <text x="652" y="954" font-size="12.5" fill="#222" font-family="monospace">(or 1 if C bypassed) → PASS/FAIL</text>
+  <text x="640" y="972" font-size="12.5" fill="#222" font-family="monospace">frame_sync.on_image() joins w/ metadata_a</text>
+  <text x="652" y="990" font-size="12.5" fill="#c2185b" font-family="monospace">→ burn_metadata_on_frame()</text>
+  <text x="652" y="1006" font-size="12.5" fill="#c2185b" font-family="monospace">→ gst_sink.send() (stream out)</text>
+  <text x="640" y="1024" font-size="12.5" fill="#222" font-family="monospace">log transport_ms / ring_ms</text>
 
   <!-- manager col 3: metadata collector + done -->
   <text x="1112" y="884" font-size="12.5" font-weight="bold" fill="#1a56c4">METADATA COLLECTOR</text>
-  <text x="1112" y="904" font-size="12.5" fill="#222" font-family="monospace">on_metadata() ← metadata_a</text>
-  <text x="1124" y="922" font-size="12.5" fill="#222" font-family="monospace">record WxH, mean_brightness</text>
-  <text x="1112" y="946" font-size="12.5" fill="#c0392b" font-family="monospace">backlog full → drop new frame</text>
-  <text x="1124" y="964" font-size="12.5" fill="#c0392b" font-family="monospace">(MAX_PENDING_BACKLOG, no pause)</text>
-  <text x="1112" y="986" font-size="12.5" fill="#222" font-family="monospace">stale pending → garbage-collected</text>
+  <text x="1112" y="900" font-size="11" fill="#888" font-style="italic">manager_node.py · frame_sync.py</text>
+  <text x="1112" y="918" font-size="12.5" fill="#222" font-family="monospace">on_metadata() ← metadata_a</text>
+  <text x="1124" y="936" font-size="12.5" fill="#222" font-family="monospace">record WxH, mean_brightness</text>
+  <text x="1112" y="954" font-size="12.5" fill="#c0392b" font-family="monospace">frame_sync.backlog_full() → drop</text>
+  <text x="1124" y="970" font-size="12.5" fill="#c0392b" font-family="monospace">(MAX_PENDING_BACKLOG, no pause)</text>
+  <text x="1112" y="988" font-size="12.5" fill="#222" font-family="monospace">frame_sync.expire_stale() → GC</text>
   <text x="1124" y="1004" font-size="12.5" fill="#222" font-family="monospace">(PENDING_FRAME_TIMEOUT_S)</text>
-  <text x="1112" y="1026" font-size="12.5" fill="#222" font-family="monospace">video EOF + drained → summary</text>
-  <text x="1124" y="1044" font-size="12.5" fill="#7b3fbf" font-family="monospace">control_pub → control (STOP)</text>
+  <text x="1112" y="1024" font-size="12.5" fill="#222" font-family="monospace">video EOF + drained → summary</text>
+  <text x="1124" y="1040" font-size="12.5" fill="#7b3fbf" font-family="monospace">control_pub → control (STOP)</text>
 
   <!-- ============================ VERTICAL CONNECTORS (each on its own track) ============================ -->
   <!-- Column A: new_frame (up), control (up), metadata_a (down) -->
@@ -191,9 +196,9 @@
 
   <rect x="110" y="1110" width="1480" height="100" rx="10" fill="#ffffff" stroke="#1a1a2e" stroke-width="2"/>
   <rect x="110" y="1110" width="1480" height="30" rx="10" fill="#8a1a5a"/>
-  <text x="850" y="1130" text-anchor="middle" font-size="15" font-weight="bold" fill="#fff">LIVE STREAM OUT — background worker thread (gst-launch-1.0 writer)</text>
-  <text x="134" y="1158" font-size="12.5" fill="#222" font-family="monospace">on join (out_c + metadata_a for the same frame_id): burn frame_id + mean_brightness onto the frame → gst_queue.put()</text>
-  <text x="134" y="1180" font-size="12.5" fill="#c2185b" font-family="monospace">worker thread: gst_queue.get() → gst-launch-1.0 stdin.write() → MJPEG/RTP over UDP → GST_UDP_HOST:GST_UDP_PORT</text>
+  <text x="850" y="1130" text-anchor="middle" font-size="15" font-weight="bold" fill="#fff">LIVE STREAM OUT — gst_sink.py: background worker thread (gst-launch-1.0 writer)</text>
+  <text x="134" y="1158" font-size="12.5" fill="#222" font-family="monospace">on join (frame_sync.py pairs out_c + metadata_a for frame_id): burn_metadata_on_frame() (frame_codec.py) → gst_sink.send()</text>
+  <text x="134" y="1180" font-size="12.5" fill="#c2185b" font-family="monospace">GstSink worker thread: queue.get() → gst-launch-1.0 stdin.write() → MJPEG/RTP over UDP → GST_UDP_HOST:GST_UDP_PORT</text>
   <text x="134" y="1198" font-size="11.5" fill="#888" font-style="italic">consumed outside the pipeline, e.g. gst-launch-1.0/ffplay on the devcontainer host (see scripts/relay-stream.sh)</text>
 
   <!-- ============================ LEGEND (bottom strip) ============================ -->
@@ -208,11 +213,12 @@
   <text x="164" y="1313" font-size="13" fill="#222">at a time; on_frame only enqueues (never blocks).</text>
   <rect x="130" y="1335" width="24" height="15" rx="3" fill="#fdecdd" stroke="#e8862e"/>
   <text x="164" y="1347" font-size="13" fill="#222"><tspan font-weight="bold">Worker thread</tspan> — A/B/C: fake work + publish, off</text>
-  <text x="164" y="1365" font-size="13" fill="#222">the executor. manager: drains a queue into</text>
-  <text x="164" y="1383" font-size="13" fill="#222">gst-launch's stdin (streaming out).</text>
-  <rect x="130" y="1405" width="24" height="15" rx="11" fill="#fff4d6" stroke="#e0a020"/>
-  <text x="164" y="1417" font-size="13" fill="#222"><tspan font-weight="bold">queue.Queue</tspan> — hand-off; 0.5s poll timeout so</text>
-  <text x="164" y="1435" font-size="13" fill="#222">stop_worker()/stop_gst() (Event+join) exit cleanly.</text>
+  <text x="164" y="1365" font-size="13" fill="#222">the executor. manager has two: video_source.py paces</text>
+  <text x="164" y="1383" font-size="13" fill="#222">video decode; gst_sink.py drains a queue into</text>
+  <text x="164" y="1401" font-size="13" fill="#222">gst-launch's stdin (streaming out).</text>
+  <rect x="130" y="1423" width="24" height="15" rx="11" fill="#fff4d6" stroke="#e0a020"/>
+  <text x="164" y="1435" font-size="13" fill="#222"><tspan font-weight="bold">queue.Queue</tspan> — hand-off; 0.5s poll timeout so</text>
+  <text x="164" y="1453" font-size="13" fill="#222">GstSink.stop() (Event+join) exits cleanly.</text>
 
   <!-- legend col 2: arrows -->
   <line x1="620" y1="1291" x2="652" y2="1291" stroke="#2e8b57" stroke-width="3" marker-end="url(#arrGreen)"/>
